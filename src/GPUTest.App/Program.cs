@@ -6,6 +6,7 @@ using GPUTest.App.Simulation;
 using System.Numerics;
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
+using Vortice.Direct3D12.Debug;
 using Vortice.DXGI;
 
 namespace GPUTest.App;
@@ -20,6 +21,12 @@ internal static partial class Program
     {
         try
         {
+            if (args.Contains("--gpu-validation"))
+            {
+                using ID3D12Debug debug = D3D12.D3D12GetDebugInterface<ID3D12Debug>();
+                debug.EnableDebugLayer();
+                Console.WriteLine("D3D12 debug-layer validation enabled.");
+            }
             if (args.Contains("--render-probe") || (args.Length > 0 && args[0] == "--benchmark"))
             {
                 bool benchmark = args[0] == "--benchmark";
@@ -57,6 +64,9 @@ internal static partial class Program
                 }
                 if (benchmark)
                 {
+                    long drainStart = Stopwatch.GetTimestamp();
+                    renderer.WaitIdle();
+                    timings[^1] += Stopwatch.GetElapsedTime(drainStart).TotalMilliseconds;
                     Array.Sort(timings);
                     double average = timings.Average();
                     double p95 = timings[(int)((measuredFrames - 1) * 0.95)];
@@ -66,9 +76,7 @@ internal static partial class Program
                     return 0;
                 }
                 Directory.CreateDirectory("artifacts");
-                using var screenshot = new Bitmap(window.ClientSize.Width, window.ClientSize.Height);
-                using (Graphics graphics = Graphics.FromImage(screenshot))
-                    graphics.CopyFromScreen(window.PointToScreen(Point.Empty), Point.Empty, screenshot.Size);
+                using var screenshot = renderer.Capture();
                 screenshot.Save("artifacts/render-probe.png");
                 for (int region = 0; region < 2; region++)
                 {

@@ -12,13 +12,22 @@ internal struct BallPose
     public Quaternion Orientation;
 }
 
-internal sealed partial class PhysicsWorld : SafeHandleZeroOrMinusOneIsInvalid
+internal interface IPhysicsWorld : IDisposable
+{
+    BallPose[] Poses { get; }
+    int Escaped { get; }
+    void Step(Vector3 position, Quaternion orientation);
+    void CopyPoses();
+}
+
+internal sealed partial class PhysicsWorld : SafeHandleZeroOrMinusOneIsInvalid, IPhysicsWorld
 {
     public const float Timestep = 1f / 120f;
     public const float HalfExtent = 5f;
     public const float Radius = 0.08f;
     public BallPose[] Poses { get; }
     public int Escaped { get; private set; }
+    public bool CubeIsSleeping => CubeSleeping(this) != 0;
 
     public PhysicsWorld(int count) : base(true)
     {
@@ -27,7 +36,8 @@ internal sealed partial class PhysicsWorld : SafeHandleZeroOrMinusOneIsInvalid
         Poses = new BallPose[count];
         SetHandle(Create(count, HalfExtent, Radius));
         if (IsInvalid) throw NativeError();
-        CopyPoses();
+        try { CopyPoses(); }
+        catch { Dispose(); throw; }
     }
 
     public unsafe void Step(Vector3 position, Quaternion orientation)
@@ -58,6 +68,8 @@ internal sealed partial class PhysicsWorld : SafeHandleZeroOrMinusOneIsInvalid
     private static partial nint LastError();
     [LibraryImport("GPUTest.Physics", EntryPoint = "gp_step")]
     private static unsafe partial int StepNative(PhysicsWorld world, float timestep, float* target);
+    [LibraryImport("GPUTest.Physics", EntryPoint = "gp_cube_sleeping")]
+    private static partial int CubeSleeping(PhysicsWorld world);
     [LibraryImport("GPUTest.Physics", EntryPoint = "gp_copy")]
     private static unsafe partial int Copy(PhysicsWorld world, BallPose* output, int capacity, out int escaped);
 }

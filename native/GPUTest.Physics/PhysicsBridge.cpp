@@ -55,6 +55,7 @@ namespace
         PxScene* scene = nullptr;
         PxMaterial* material = nullptr;
         PxRigidDynamic* cube = nullptr;
+        PxTransform lastCubeTarget{PxIdentity};
         std::vector<PxRigidDynamic*> balls;
         float halfExtent = 5;
         float radius = 0.08f;
@@ -185,12 +186,22 @@ extern "C" __declspec(dllexport) int gp_step(World* world, float timestep, const
             throw std::invalid_argument("Invalid physics step.");
         const PxTransform pose(PxVec3(target[0], target[1], target[2]), PxQuat(target[3], target[4], target[5], target[6]));
         if (!pose.isValid()) throw std::invalid_argument("Invalid cube target.");
-        world->cube->setKinematicTarget(pose);
+        const PxTransform& previous = world->lastCubeTarget;
+        if (pose.p != previous.p || (!(pose.q == previous.q) && !(pose.q == -previous.q)))
+        {
+            world->cube->setKinematicTarget(pose);
+            world->lastCubeTarget = pose;
+        }
         world->scene->simulate(timestep);
         PxU32 error = 0;
         if (!world->scene->fetchResults(true, &error) || error != 0) throw std::runtime_error("GPU simulation failed.");
         world->errors.check();
     });
+}
+
+extern "C" __declspec(dllexport) int gp_cube_sleeping(World* world)
+{
+    return world && world->cube->isSleeping() ? 1 : 0;
 }
 
 extern "C" __declspec(dllexport) int gp_copy(World* world, BallPose* output, int capacity, int* escaped)

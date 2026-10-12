@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.Numerics;
-using System.Runtime.InteropServices;
 using GPUTest.App.Rendering;
 using GPUTest.App.Simulation;
 
@@ -12,24 +11,34 @@ internal sealed partial class MainWindow : Form
     private readonly NumericUpDown count = new() { Minimum = 0, Maximum = 100_000, Increment = 1_000, Value = 10_000, ThousandsSeparator = true, Width = 110 };
     private readonly Button pause = new() { Text = "Pause", AutoSize = true };
     private readonly ToolStripStatusLabel status = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
-    private PhysicsWorld? world;
+    private PhysicsWorker? simulation;
+    private PhysicsSnapshot snapshot = new();
     private DualGpuRenderer? renderer;
-    private CubeController cube = new();
+    private Vector3 targetPosition;
+    private Quaternion targetOrientation = Quaternion.Identity;
+    private int generation = 1;
+    private readonly System.Windows.Forms.Timer renderTimer = new() { Interval = 1 };
     private bool paused;
     private bool resizePending;
     private bool shuttingDown;
+    private bool shutdownComplete;
     private MouseButtons dragging;
     private Point previousMouse;
-    private readonly SimulationClock clock = new();
     private bool slowMotionSinceStatus;
-    private long lastTick;
     private long lastStatusTick;
+    private long lastStatusSteps;
     private int frames;
     private readonly bool smokeTest;
     private int smokeFrame;
-    private bool smokeOverloadObserved;
     private bool smokeMessageProcessed;
-    private int smokeStepsAfterOverload;
+    private readonly ManualResetEventSlim smokeStepBlocked = new();
+    private readonly ManualResetEventSlim smokeReleaseStep = new();
+    private int smokeBlockRequested;
+    private long smokeBlockStart;
+    private long smokeStartSteps;
+    private bool smokeCallbackQueued;
+    private double smokeCallbackMilliseconds;
+    private long smokeManualStep = -1;
     public Exception? Failure { get; private set; }
 
     public MainWindow(bool smokeTest = false)
@@ -53,59 +62,72 @@ internal sealed partial class MainWindow : Form
         pause.Click += (_, _) => SetPaused(!paused);
         step.Click += (_, _) =>
         {
-            SetPaused(true);
-            if (world is null) return;
-            try { AdvancePhysics(); world.CopyPoses(); }
-            catch (Exception exception) { Fail(exception); }
+            if (!paused) SetPaused(true);
+            simulation?.RequestStep();
         };
         viewport.Resize += (_, _) => resizePending = true;
         viewport.MouseDown += (_, args) => { dragging = args.Button; previousMouse = args.Location; viewport.Capture = true; viewport.Focus(); };
         viewport.MouseUp += (_, _) => { dragging = MouseButtons.None; viewport.Capture = false; };
         viewport.MouseCaptureChanged += (_, _) => { if (!viewport.Capture) dragging = MouseButtons.None; };
         viewport.MouseMove += MoveCube;
-        viewport.MouseWheel += (_, args) => cube.TargetPosition = Vector3.Clamp(cube.TargetPosition + Vector3.Normalize(new Vector3(13, 10, 19)) * (args.Delta / 600f), new Vector3(-4), new Vector3(4));
+        viewport.MouseWheel += (_, args) =>
+        {
+            targetPosition = Vector3.Clamp(targetPosition + Vector3.Normalize(new Vector3(13, 10, 19)) * (args.Delta / 600f), new Vector3(-4), new Vector3(4));
+            PublishTarget();
+        };
         Deactivate += (_, _) => { dragging = MouseButtons.None; viewport.Capture = false; };
         Shown += (_, _) =>
         {
             ResetSimulation();
-            lastTick = lastStatusTick = Stopwatch.GetTimestamp();
-            Application.Idle += OnIdle;
+            lastStatusTick = Stopwatch.GetTimestamp();
+            renderTimer.Start();
         };
-        FormClosed += (_, _) =>
+        renderTimer.Tick += OnFrame;
+        FormClosing += async (_, args) =>
         {
+            if (shutdownComplete) return;
+            args.Cancel = true;
+            if (shuttingDown) return;
             shuttingDown = true;
-            Application.Idle -= OnIdle;
-            renderer?.Dispose();
-            world?.Dispose();
+            renderTimer.Stop();
+            smokeReleaseStep.Set();
+            try
+            {
+                if (simulation is not null) await simulation.StopAsync();
+                renderer?.Dispose();
+            }
+            catch (Exception exception) { Failure ??= exception; Console.Error.WriteLine(exception); }
+            finally
+            {
+                renderTimer.Dispose();
+                smokeStepBlocked.Dispose();
+                smokeReleaseStep.Dispose();
+                shutdownComplete = true;
+                BeginInvoke(Close);
+            }
         };
     }
 
     private void ResetSimulation()
     {
-        SetPaused(true);
         UseWaitCursor = true;
         status.Text = "Creating GPU simulation...";
-        status.Owner?.Refresh();
-        try
+        targetPosition = Vector3.Zero;
+        targetOrientation = Quaternion.Identity;
+        if (simulation is null)
         {
-            world?.Dispose();
-            world = null;
-            cube = new CubeController();
-            world = new PhysicsWorld((int)count.Value);
-            SetPaused(false);
-            lastTick = Stopwatch.GetTimestamp();
+            simulation = new PhysicsWorker((int)count.Value, beforeStep: smokeTest ? BeforeSmokeStep : null);
         }
-        catch (Exception exception) { Fail(exception); }
-        finally { UseWaitCursor = false; }
+        else generation = simulation.Reset((int)count.Value);
+        SetPaused(false);
     }
 
     private void SetPaused(bool value)
     {
         paused = value;
         pause.Text = paused ? "Resume" : "Pause";
-        clock.Reset();
+        simulation?.SetPaused(value);
         slowMotionSinceStatus = false;
-        lastTick = Stopwatch.GetTimestamp();
     }
 
     private void MoveCube(object? sender, MouseEventArgs args)
@@ -115,13 +137,14 @@ internal sealed partial class MainWindow : Form
         previousMouse = args.Location;
         if (dragging == MouseButtons.Left)
         {
-            cube.TargetPosition = Vector3.Clamp(cube.TargetPosition + DragTranslation(new Vector2(horizontal, vertical), viewport.Height, cube.Position), new Vector3(-4), new Vector3(4));
+            targetPosition = Vector3.Clamp(targetPosition + DragTranslation(new Vector2(horizontal, vertical), viewport.Height, snapshot.CubePosition), new Vector3(-4), new Vector3(4));
         }
         else if (dragging == MouseButtons.Right)
         {
             Quaternion change = Quaternion.CreateFromYawPitchRoll(horizontal * 0.005f, vertical * 0.005f, 0);
-            cube.TargetOrientation = Quaternion.Normalize(change * cube.TargetOrientation);
+            targetOrientation = Quaternion.Normalize(change * targetOrientation);
         }
+        if (dragging is MouseButtons.Left or MouseButtons.Right) PublishTarget();
     }
 
     internal static Vector3 DragTranslation(Vector2 pixels, int viewportHeight, Vector3 position)
@@ -135,98 +158,106 @@ internal sealed partial class MainWindow : Form
         return (right * pixels.X - up * pixels.Y) * worldUnitsPerPixel;
     }
 
-    private void AdvancePhysics()
+    private void PublishTarget() => simulation?.SetTarget(targetPosition, targetOrientation);
+
+    private void BeforeSmokeStep()
     {
-        cube.Advance();
-        world!.Step(cube.Position, cube.Orientation);
-        if (smokeTest && smokeOverloadObserved) smokeStepsAfterOverload++;
+        if (Interlocked.Exchange(ref smokeBlockRequested, 0) == 0) return;
+        Volatile.Write(ref smokeBlockStart, Stopwatch.GetTimestamp());
+        smokeStepBlocked.Set();
+        if (!smokeReleaseStep.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("UI did not release the blocked physics step.");
     }
 
-    private void OnIdle(object? sender, EventArgs args)
+    private void OnFrame(object? sender, EventArgs args)
     {
-        while (!shuttingDown && !IsDisposed && !PeekMessage(out _, 0, 0, 0, 0))
+        if (shuttingDown || IsDisposed || simulation is null) return;
+        try
         {
-            if (WindowState == FormWindowState.Minimized || world is null || viewport.Width < 2 || viewport.Height < 1)
+            if (simulation.Failure is { } failure) throw failure;
+            bool suspended = WindowState == FormWindowState.Minimized || viewport.Width < 2 || viewport.Height < 1;
+            simulation.SetSuspended(suspended);
+            if (suspended) return;
+            if (smokeTest && smokeStepBlocked.IsSet && !smokeCallbackQueued)
             {
-                lastTick = Stopwatch.GetTimestamp();
-                clock.Reset();
-                return;
+                smokeCallbackQueued = true;
+                BeginInvoke(() =>
+                {
+                    smokeCallbackMilliseconds = Stopwatch.GetElapsedTime(Volatile.Read(ref smokeBlockStart)).TotalMilliseconds;
+                    smokeMessageProcessed = true;
+                    smokeReleaseStep.Set();
+                });
             }
-            try
+            if (simulation.TrySwapSnapshot(ref snapshot)) slowMotionSinceStatus |= snapshot.SlowingDown;
+            if (snapshot.Generation != generation) return;
+            UseWaitCursor = false;
+            if (renderer is null || resizePending)
             {
-                if (renderer is null || resizePending)
-                {
-                    renderer?.Dispose();
-                    renderer = null;
-                    renderer = new DualGpuRenderer(viewport.Handle, viewport.Width, viewport.Height);
-                    resizePending = false;
-                    lastTick = Stopwatch.GetTimestamp();
-                    clock.Reset();
-                }
-                long now = Stopwatch.GetTimestamp();
-                double elapsed = Stopwatch.GetElapsedTime(lastTick, now).TotalSeconds;
-                lastTick = now;
-                if (!paused)
-                {
-                    if (smokeTest && smokeFrame == 20) elapsed += 0.75;
-                    clock.BeginFrame(elapsed);
-                    long physicsStart = Stopwatch.GetTimestamp();
-                    while (!PeekMessage(out _, 0, 0, 0, 0)
-                        && clock.TryTakeStep(Stopwatch.GetElapsedTime(physicsStart).TotalSeconds))
-                    {
-                        AdvancePhysics();
-                    }
-                    clock.EndFrame();
-                    slowMotionSinceStatus |= clock.IsSlowingDown;
-                    if (smokeTest && smokeFrame >= 20 && clock.IsSlowingDown) smokeOverloadObserved = true;
-                    world.CopyPoses();
-                    if (world.Escaped != 0) throw new InvalidOperationException($"Containment failure: {world.Escaped} escaped balls.");
-                }
-                renderer.Render(world.Poses, cube.Position, cube.Orientation);
-                if (smokeTest)
-                {
-                    smokeFrame++;
-                    if (paused && smokeFrame < 375) throw new InvalidOperationException("UI smoke test unexpectedly paused.");
-                    if (smokeFrame == 10)
-                    {
-                        cube.TargetPosition = new Vector3(1, 0.4f, 0);
-                        cube.TargetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, 0.25f);
-                    }
-                    if (smokeFrame == 35) ClientSize = new Size(1024, 720);
-                    if (smokeFrame == 21) BeginInvoke(() => smokeMessageProcessed = true);
-                    if (smokeFrame is >= 30 and < 330)
-                    {
-                        float phase = (smokeFrame - 30) * 0.035f;
-                        cube.TargetPosition = new Vector3(2 * MathF.Sin(phase), 0.6f * MathF.Sin(phase * 1.3f), 0);
-                        cube.TargetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, 0.6f * MathF.Sin(phase * 0.75f));
-                    }
-                    if (smokeFrame == 355) { count.Value = 1000; ResetSimulation(); }
-                    if (smokeFrame == 375) { SetPaused(true); AdvancePhysics(); world.CopyPoses(); }
-                    if (smokeFrame == 385)
-                    {
-                        if (!smokeOverloadObserved || !smokeMessageProcessed || smokeStepsAfterOverload < 100)
-                            throw new InvalidOperationException("UI smoke test did not demonstrate continued physics and UI message processing after overload.");
-                        Directory.CreateDirectory("artifacts");
-                        using var screenshot = new Bitmap(ClientSize.Width, ClientSize.Height);
-                        using (Graphics graphics = Graphics.FromImage(screenshot)) graphics.CopyFromScreen(PointToScreen(Point.Empty), Point.Empty, screenshot.Size);
-                        screenshot.Save("artifacts/ui-smoke.png");
-                        Console.WriteLine($"PASS: sustained movement, overload recovery ({smokeStepsAfterOverload} subsequent physics steps), queued UI callback, resize, count reset, pause and single-step.");
-                        BeginInvoke(Close);
-                        return;
-                    }
-                }
-                frames++;
-                double statusElapsed = Stopwatch.GetElapsedTime(lastStatusTick).TotalSeconds;
-                if (statusElapsed >= 0.5)
-                {
-                    string state = paused ? "Paused" : slowMotionSinceStatus ? "Slow motion (physics overload)" : "Running";
-                    status.Text = $"{state}   |   {world.Poses.Length:N0} balls   |   {frames / statusElapsed:F1} render FPS   |   2 x RTX 4090 rendering";
-                    frames = 0;
-                    slowMotionSinceStatus = false;
-                    lastStatusTick = Stopwatch.GetTimestamp();
-                }
+                renderer?.Dispose();
+                renderer = null;
+                renderer = new DualGpuRenderer(viewport.Handle, viewport.Width, viewport.Height);
+                resizePending = false;
             }
-            catch (Exception exception) { Fail(exception); return; }
+            if (!renderer.TryRender(snapshot.Poses, snapshot.CubePosition, snapshot.CubeOrientation)) return;
+            if (smokeTest) RunSmokeFrame();
+            frames++;
+            double statusElapsed = Stopwatch.GetElapsedTime(lastStatusTick).TotalSeconds;
+            if (statusElapsed >= 0.5)
+            {
+                string state = paused ? "Paused" : slowMotionSinceStatus ? "Slow motion (physics overload)" : "Running";
+                double simulationRate = (snapshot.Steps - lastStatusSteps) * PhysicsWorld.Timestep / statusElapsed;
+                status.Text = $"{state}   |   {snapshot.Poses.Length:N0} balls   |   {frames / statusElapsed:F1} render FPS   |   sim {simulationRate:F2}x   |   2 x RTX 4090";
+                frames = 0;
+                lastStatusSteps = snapshot.Steps;
+                slowMotionSinceStatus = false;
+                lastStatusTick = Stopwatch.GetTimestamp();
+            }
+        }
+        catch (Exception exception) { Fail(exception); }
+    }
+
+    private void RunSmokeFrame()
+    {
+        smokeFrame++;
+        if (paused && smokeFrame < 375) throw new InvalidOperationException("UI smoke test unexpectedly paused.");
+        if (smokeFrame == 10)
+        {
+            targetPosition = new Vector3(1, 0.4f, 0);
+            targetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, 0.25f);
+            PublishTarget();
+        }
+        if (smokeFrame == 20)
+        {
+            smokeStartSteps = snapshot.Steps;
+            Interlocked.Exchange(ref smokeBlockRequested, 1);
+        }
+        if (smokeFrame == 35) ClientSize = new Size(1024, 720);
+        if (smokeFrame is >= 30 and < 330)
+        {
+            float phase = (smokeFrame - 30) * 0.035f;
+            targetPosition = new Vector3(2 * MathF.Sin(phase), 0.6f * MathF.Sin(phase * 1.3f), 0);
+            targetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, 0.6f * MathF.Sin(phase * 0.75f));
+            PublishTarget();
+        }
+        if (smokeFrame == 355) { count.Value = 1000; ResetSimulation(); }
+        if (smokeFrame == 375) SetPaused(true);
+        if (smokeFrame > 375 && snapshot.Paused && smokeManualStep < 0)
+        {
+            smokeManualStep = snapshot.Steps;
+            simulation!.RequestStep();
+        }
+        if (smokeFrame == 385)
+        {
+            long subsequentSteps = snapshot.Steps - smokeStartSteps;
+            if (!smokeMessageProcessed || smokeCallbackMilliseconds > 250 || subsequentSteps < 100)
+                throw new InvalidOperationException($"UI responsiveness check failed: callback={smokeCallbackMilliseconds:F1}ms, steps={subsequentSteps}.");
+            if (smokeManualStep < 0 || !snapshot.Paused || snapshot.Steps != smokeManualStep + 1)
+                throw new InvalidOperationException("Paused single-step did not advance exactly once.");
+            Directory.CreateDirectory("artifacts");
+            using var screenshot = renderer!.Capture();
+            screenshot.Save("artifacts/ui-smoke.png");
+            Console.WriteLine($"PASS: UI callback during blocked physics step ({smokeCallbackMilliseconds:F1}ms), {subsequentSteps} subsequent steps, sustained movement, resize, count reset, pause and exact single-step.");
+            renderTimer.Stop();
+            BeginInvoke(Close);
         }
     }
 
@@ -234,27 +265,12 @@ internal sealed partial class MainWindow : Form
     {
         Failure = exception;
         SetPaused(true);
-        Application.Idle -= OnIdle;
+        renderTimer.Stop();
+        UseWaitCursor = false;
         status.Text = exception.Message;
         Console.Error.WriteLine(exception);
         if (smokeTest) { BeginInvoke(Close); return; }
         MessageBox.Show(this, exception.Message, "GPUTest stopped", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct WindowMessage
-    {
-        public nint Window;
-        public uint Message;
-        public nuint WParam;
-        public nint LParam;
-        public uint Time;
-        public int PointX;
-        public int PointY;
-        public uint Private;
-    }
-
-    [LibraryImport("user32.dll", EntryPoint = "PeekMessageW")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool PeekMessage(out WindowMessage message, nint window, uint minimum, uint maximum, uint remove);
 }

@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using GPUTest.App;
 using GPUTest.App.Simulation;
@@ -10,6 +11,154 @@ namespace GPUTest.Tests;
 
 public sealed class PhysicsTests
 {
+    [Fact]
+    public async Task WorkerAcceptsCommandsDuringBlockedStepAndKeepsSnapshotStable()
+    {
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var fake = new TestPhysicsWorld(1, entered, release);
+        await using var worker = new PhysicsWorker(1, true, _ => fake);
+        var snapshot = await NextSnapshot(worker, value => value.Paused);
+        PhysicsSnapshot held = snapshot;
+        worker.RequestStep();
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+        try
+        {
+            long start = Stopwatch.GetTimestamp();
+            worker.SetTarget(Vector3.UnitX, Quaternion.Identity);
+            worker.SetPaused(true);
+            Assert.False(worker.TrySwapSnapshot(ref snapshot));
+            Assert.True(Stopwatch.GetElapsedTime(start) < TimeSpan.FromMilliseconds(100));
+            Assert.Equal(0, held.Steps);
+            Assert.Equal(Vector3.Zero, held.Poses[0].Position);
+        }
+        finally { release.Set(); }
+        snapshot = await NextSnapshot(worker, value => value.Steps == 1 && value.Paused, snapshot);
+        Assert.Equal(Vector3.UnitX, snapshot.Poses[0].Position);
+        worker.RequestStep();
+        snapshot = await NextSnapshot(worker, value => value.Steps == 2, snapshot);
+        Assert.Equal(new Vector3(2, 0, 0), snapshot.Poses[0].Position);
+        await worker.StopAsync();
+        Assert.Null(worker.Failure);
+        Assert.True(fake.Disposed);
+        Assert.Single(fake.Threads.Distinct());
+    }
+
+    [Fact]
+    public async Task WorkerShutdownDoesNotDisposeAnInFlightWorld()
+    {
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var fake = new TestPhysicsWorld(1, entered, release);
+        await using var worker = new PhysicsWorker(1, true, _ => fake);
+        await NextSnapshot(worker, value => value.Paused);
+        worker.RequestStep();
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+        Task stopped;
+        try
+        {
+            stopped = worker.StopAsync();
+            Assert.False(stopped.IsCompleted);
+            Assert.False(fake.Disposed);
+        }
+        finally { release.Set(); }
+        await stopped.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Null(worker.Failure);
+        Assert.True(fake.Disposed);
+    }
+
+    [Fact]
+    public async Task WorkerProcessesEveryQueuedSingleStep()
+    {
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var fake = new TestPhysicsWorld(1, entered, release);
+        await using var worker = new PhysicsWorker(1, true, _ => fake);
+        var snapshot = await NextSnapshot(worker, value => value.Paused);
+        worker.RequestStep();
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+        try
+        {
+            for (int request = 0; request < 16; request++) worker.RequestStep();
+        }
+        finally { release.Set(); }
+        snapshot = await NextSnapshot(worker, value => value.Steps == 17, snapshot);
+        Assert.True(snapshot.Paused);
+        Assert.Equal(new Vector3(17, 0, 0), snapshot.Poses[0].Position);
+    }
+
+    [Fact]
+    public async Task WorkerResetReplacesWorldAndPublishesMatchingGeneration()
+    {
+        var worlds = new List<TestPhysicsWorld>();
+        await using var worker = new PhysicsWorker(1, true, size =>
+        {
+            var world = new TestPhysicsWorld(size);
+            worlds.Add(world);
+            return world;
+        });
+        var snapshot = await NextSnapshot(worker, value => value.Generation == 1);
+        int generation = worker.Reset(2);
+        worker.SetPaused(true);
+        snapshot = await NextSnapshot(worker, value => value.Generation == generation && value.Paused, snapshot);
+        Assert.Equal(2, snapshot.Poses.Length);
+        Assert.Equal(Vector3.Zero, snapshot.CubePosition);
+        worker.RequestStep();
+        snapshot = await NextSnapshot(worker, value => value.Generation == generation && value.Steps == 1, snapshot);
+        await worker.StopAsync();
+        Assert.Null(worker.Failure);
+        Assert.All(worlds, world => Assert.True(world.Disposed));
+        Assert.Single(worlds.SelectMany(world => world.Threads).Distinct());
+    }
+
+    [Fact]
+    public async Task WorkerReportsNativeFailureAndStillDisposesWorld()
+    {
+        var fake = new TestPhysicsWorld(1) { FailStep = true };
+        await using var worker = new PhysicsWorker(1, true, _ => fake);
+        await NextSnapshot(worker, value => value.Paused);
+        worker.RequestStep();
+        long start = Stopwatch.GetTimestamp();
+        while (worker.Failure is null && Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(5)) await Task.Delay(5);
+        Assert.IsType<InvalidOperationException>(worker.Failure);
+        await worker.StopAsync();
+        Assert.True(fake.Disposed);
+    }
+
+    private static async Task<PhysicsSnapshot> NextSnapshot(PhysicsWorker worker, Func<PhysicsSnapshot, bool> predicate, PhysicsSnapshot? snapshot = null)
+    {
+        snapshot ??= new PhysicsSnapshot();
+        long start = Stopwatch.GetTimestamp();
+        while (Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(10))
+        {
+            Assert.Null(worker.Failure);
+            if (worker.TrySwapSnapshot(ref snapshot) && predicate(snapshot)) return snapshot;
+            await Task.Delay(5);
+        }
+        throw new TimeoutException("Physics worker did not publish the expected snapshot.");
+    }
+
+    private sealed class TestPhysicsWorld(int count, ManualResetEventSlim? entered = null, ManualResetEventSlim? release = null) : IPhysicsWorld
+    {
+        public BallPose[] Poses { get; } = new BallPose[count];
+        public int Escaped => 0;
+        public List<int> Threads { get; } = [];
+        public bool Disposed { get; private set; }
+        public bool FailStep { get; init; }
+
+        public void Step(Vector3 position, Quaternion orientation)
+        {
+            Threads.Add(Environment.CurrentManagedThreadId);
+            entered?.Set();
+            if (release is not null && !release.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("Blocked test step was not released.");
+            if (FailStep) throw new InvalidOperationException("Injected physics failure.");
+            if (Poses.Length > 0) Poses[0].Position += Vector3.UnitX;
+        }
+
+        public void CopyPoses() => Threads.Add(Environment.CurrentManagedThreadId);
+        public void Dispose() { Threads.Add(Environment.CurrentManagedThreadId); Disposed = true; }
+    }
+
     [Fact]
     public void SimulationClockContinuesAfterOverloadAndRecovers()
     {
@@ -112,6 +261,24 @@ public sealed class PhysicsTests
         }
         for (int step = 0; step < 12; step++) controller.Advance();
         Assert.InRange(Vector3.Distance(controller.Position, controller.TargetPosition), 0, 0.001f);
+    }
+
+    [Fact]
+    [Trait("Category", "GPU")]
+    public void StationaryCubeSleepsAndWakesForNextTarget()
+    {
+        using var world = new PhysicsWorld(1);
+        for (int step = 0; step < 120; step++)
+            world.Step(Vector3.Zero, step % 2 == 0 ? Quaternion.Identity : -Quaternion.Identity);
+        Assert.True(world.CubeIsSleeping);
+        world.Step(new Vector3(0, 0.02f, 0), Quaternion.Identity);
+        Assert.False(world.CubeIsSleeping);
+        for (int step = 0; step < 480; step++) world.Step(new Vector3(0, 0.02f, 0), Quaternion.Identity);
+        Assert.True(world.CubeIsSleeping);
+        world.CopyPoses();
+        Assert.Equal(0, world.Escaped);
+        Assert.InRange(world.Poses[0].Position.Y, -PhysicsWorld.HalfExtent + PhysicsWorld.Radius + 0.01f,
+            -PhysicsWorld.HalfExtent + PhysicsWorld.Radius + 0.03f);
     }
 
     [Fact]
