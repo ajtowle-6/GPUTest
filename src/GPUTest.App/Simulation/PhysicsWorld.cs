@@ -16,6 +16,7 @@ internal interface IPhysicsWorld : IDisposable
 {
     BallPose[] Poses { get; }
     int Escaped { get; }
+    bool IsSleeping { get; }
     long AdapterLuid { get; }
     void Step(Vector3 position, Quaternion orientation);
     void CopyPoses();
@@ -28,6 +29,7 @@ internal sealed partial class PhysicsWorld : SafeHandleZeroOrMinusOneIsInvalid, 
     public const float Radius = 0.08f;
     public BallPose[] Poses { get; }
     public int Escaped { get; private set; }
+    public bool IsSleeping { get; private set; }
     public long AdapterLuid { get; }
     public bool CubeIsSleeping => CubeSleeping(this) != 0;
 
@@ -64,8 +66,9 @@ internal sealed partial class PhysicsWorld : SafeHandleZeroOrMinusOneIsInvalid, 
         ObjectDisposedException.ThrowIf(IsClosed, this);
         fixed (BallPose* output = Poses)
         {
-            if (Copy(this, output, Poses.Length, out int escaped) != 0) throw NativeError();
+            if (Copy(this, output, Poses.Length, out int escaped, out int sleeping) != 0) throw NativeError();
             Escaped = escaped;
+            IsSleeping = sleeping != 0;
         }
     }
 
@@ -101,5 +104,5 @@ internal sealed partial class PhysicsWorld : SafeHandleZeroOrMinusOneIsInvalid, 
     [LibraryImport("GPUTest.Physics", EntryPoint = "gp_profile_report")]
     private static partial int ProfileReport(PhysicsWorld world, int frames);
     [LibraryImport("GPUTest.Physics", EntryPoint = "gp_copy")]
-    private static unsafe partial int Copy(PhysicsWorld world, BallPose* output, int capacity, out int escaped);
+    private static unsafe partial int Copy(PhysicsWorld world, BallPose* output, int capacity, out int escaped, out int sleeping);
 }

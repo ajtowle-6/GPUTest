@@ -12,6 +12,101 @@ namespace GPUTest.Tests;
 public sealed class PhysicsTests
 {
     [Fact]
+    [Trait("Category", "GPU")]
+    public void MovingBallsKeepSceneAwakeAfterCubeSleeps()
+    {
+        using var world = new PhysicsWorld(1000);
+        for (int step = 0; step < 120; step++) world.Step(Vector3.Zero, Quaternion.Identity);
+        Vector3 target = MainWindow.DragTranslation(new Vector2(4, -2), 684, Vector3.Zero);
+        Quaternion rotation = Quaternion.CreateFromYawPitchRoll(0.01f, 0.005f, 0);
+        for (int step = 0; step < 5; step++) world.Step(target, rotation);
+        for (int step = 0; step < 240; step++) world.Step(target, Quaternion.Identity);
+        world.CopyPoses();
+        var before = (BallPose[])world.Poses.Clone();
+        for (int step = 0; step < 120; step++) world.Step(target, Quaternion.Identity);
+        world.CopyPoses();
+        float maximumDisplacement = world.Poses.Zip(before, (after, prior) => Vector3.Distance(after.Position, prior.Position)).Max();
+        Assert.True(world.CubeIsSleeping);
+        Assert.False(world.IsSleeping);
+        Assert.True(maximumDisplacement > 0.001f);
+        Assert.Equal(0, world.Escaped);
+    }
+
+    [Fact]
+    public async Task WorkerContinuesStationaryCubeSimulationUntilBallsSleep()
+    {
+        var fake = new TestPhysicsWorld(1) { StepsBeforeSleeping = 4 };
+        await using var worker = new PhysicsWorker(1, createWorld: _ => fake);
+        var snapshot = await NextSnapshot(worker, value => value.IsSleeping);
+        Assert.True(snapshot.Steps >= 4);
+        Assert.Equal(Vector3.Zero, snapshot.CubePosition);
+        int calls = fake.StepCount;
+        int copies = fake.CopyCount;
+        await Task.Delay(150);
+        Assert.Equal(calls, fake.StepCount);
+        Assert.Equal(copies, fake.CopyCount);
+        Assert.False(worker.TrySwapSnapshot(ref snapshot));
+    }
+
+    [Fact]
+    public async Task SleepingWorkerDoesNoPhysicsWorkAndWakesForCommands()
+    {
+        var worlds = new List<TestPhysicsWorld>();
+        await using var worker = new PhysicsWorker(1, createWorld: size =>
+        {
+            var world = new TestPhysicsWorld(size) { IsSleeping = true };
+            worlds.Add(world);
+            return world;
+        });
+        var snapshot = await NextSnapshot(worker, value => value.IsSleeping);
+        var fake = worlds[0];
+        worker.SetTarget(Vector3.Zero, -Quaternion.Identity);
+        await Task.Delay(150);
+        Assert.False(worker.TrySwapSnapshot(ref snapshot));
+        Assert.Equal(0, fake.StepCount);
+        Assert.Equal(0, fake.CopyCount);
+
+        worker.SetTarget(Vector3.UnitX, Quaternion.Identity);
+        snapshot = await NextSnapshot(worker, value => value.Steps == 1 && value.IsSleeping, snapshot);
+        Assert.Equal(Vector3.UnitX, snapshot.CubePosition);
+        Assert.False(snapshot.SlowingDown);
+        await Task.Delay(150);
+        Assert.Equal(1, fake.StepCount);
+        Assert.Equal(1, fake.CopyCount);
+
+        worker.SetSuspended(true);
+        worker.SetTarget(Vector3.UnitY, Quaternion.Identity);
+        await Task.Delay(100);
+        Assert.Equal(1, fake.StepCount);
+        worker.SetSuspended(false);
+        snapshot = await NextSnapshot(worker, value => value.Steps == 2, snapshot);
+        Assert.Equal(Vector3.UnitY, snapshot.CubePosition);
+        Assert.False(snapshot.SlowingDown);
+
+        for (int request = 0; request < 3; request++) worker.RequestStep();
+        snapshot = await NextSnapshot(worker, value => value.Paused && value.Steps == 5, snapshot);
+        worker.SetPaused(false);
+        snapshot = await NextSnapshot(worker, value => !value.Paused, snapshot);
+        await Task.Delay(100);
+        Assert.Equal(5, fake.StepCount);
+
+        Quaternion rotation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, 0.4f);
+        worker.SetTarget(Vector3.UnitY, rotation);
+        snapshot = await NextSnapshot(worker, value => value.Steps == 6 && value.IsSleeping, snapshot);
+        Assert.Equal(Quaternion.Normalize(rotation), snapshot.CubeOrientation);
+        worker.SetTarget(Vector3.UnitY, -rotation);
+        await Task.Delay(100);
+        Assert.Equal(6, fake.StepCount);
+        Assert.False(worker.TrySwapSnapshot(ref snapshot));
+
+        int generation = worker.Reset(2);
+        snapshot = await NextSnapshot(worker, value => value.Generation == generation && value.IsSleeping, snapshot);
+        Assert.True(fake.Disposed);
+        Assert.Equal(Vector3.Zero, snapshot.CubePosition);
+        Assert.Equal(0, worlds[1].StepCount);
+    }
+
+    [Fact]
     public async Task WorkerAcceptsCommandsDuringBlockedStepAndKeepsSnapshotStable()
     {
         using var entered = new ManualResetEventSlim();
@@ -144,21 +239,33 @@ public sealed class PhysicsTests
     {
         public BallPose[] Poses { get; } = new BallPose[count];
         public int Escaped => 0;
+        public bool IsSleeping { get; set; }
+        public int StepsBeforeSleeping { get; init; } = int.MaxValue;
         public long AdapterLuid => 100 + count;
         public List<int> Threads { get; } = [];
         public bool Disposed { get; private set; }
         public bool FailStep { get; init; }
+        private int stepCount;
+        private int copyCount;
+        public int StepCount => Volatile.Read(ref stepCount);
+        public int CopyCount => Volatile.Read(ref copyCount);
 
         public void Step(Vector3 position, Quaternion orientation)
         {
+            Interlocked.Increment(ref stepCount);
             Threads.Add(Environment.CurrentManagedThreadId);
             entered?.Set();
             if (release is not null && !release.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("Blocked test step was not released.");
             if (FailStep) throw new InvalidOperationException("Injected physics failure.");
             if (Poses.Length > 0) Poses[0].Position += Vector3.UnitX;
+            if (StepCount >= StepsBeforeSleeping) IsSleeping = true;
         }
 
-        public void CopyPoses() => Threads.Add(Environment.CurrentManagedThreadId);
+        public void CopyPoses()
+        {
+            Threads.Add(Environment.CurrentManagedThreadId);
+            Interlocked.Increment(ref copyCount);
+        }
         public void Dispose() { Threads.Add(Environment.CurrentManagedThreadId); Disposed = true; }
     }
 
@@ -342,6 +449,39 @@ public sealed class PhysicsTests
         }
         for (int step = 0; step < 12; step++) controller.Advance();
         Assert.InRange(Vector3.Distance(controller.Position, controller.TargetPosition), 0, 0.001f);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(1000)]
+    [Trait("Category", "GPU")]
+    public void SceneSleepsOnlyAfterAllBodiesSettleAndWakesOnMovement(int count)
+    {
+        using var world = new PhysicsWorld(count);
+        if (count > 0)
+        {
+            Assert.True(world.CubeIsSleeping);
+            Assert.False(world.IsSleeping);
+        }
+        for (int step = 0; step < 1200 && !world.IsSleeping; step++)
+        {
+            world.Step(Vector3.Zero, Quaternion.Identity);
+            world.CopyPoses();
+            Assert.Equal(0, world.Escaped);
+        }
+        Assert.True(world.IsSleeping);
+        world.Step(new Vector3(0, 0.02f, 0), Quaternion.Identity);
+        world.CopyPoses();
+        Assert.False(world.IsSleeping);
+        Assert.Equal(0, world.Escaped);
+        for (int step = 0; step < 1200 && !world.IsSleeping; step++)
+        {
+            world.Step(new Vector3(0, 0.02f, 0), Quaternion.Identity);
+            world.CopyPoses();
+            Assert.Equal(0, world.Escaped);
+        }
+        Assert.True(world.IsSleeping);
     }
 
     [Fact]

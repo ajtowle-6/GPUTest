@@ -11,6 +11,7 @@ internal sealed class PhysicsSnapshot
     public int Generation { get; set; }
     public long Steps { get; set; }
     public bool Paused { get; set; }
+    public bool IsSleeping { get; set; }
     public bool SlowingDown { get; set; }
     public long AdapterLuid { get; set; }
 }
@@ -145,6 +146,7 @@ internal sealed class PhysicsWorker : IAsyncDisposable
         int activeClockVersion = -1;
         long steps = 0;
         long lastTick = Stopwatch.GetTimestamp();
+        bool wasSleeping = false;
         try
         {
             while (true)
@@ -173,19 +175,25 @@ internal sealed class PhysicsWorker : IAsyncDisposable
                     cube = new CubeController();
                     activeGeneration = nextGeneration;
                 }
-                bool clockChanged = reset || activeClockVersion != nextClockVersion;
-                if (clockChanged)
+                Quaternion requestedOrientation = Quaternion.Normalize(cube.TargetOrientation);
+                bool targetPending = cube.TargetPosition != cube.Position
+                    || (requestedOrientation != cube.Orientation && requestedOrientation != -cube.Orientation);
+                bool idle = world!.IsSleeping && !targetPending;
+                bool waking = wasSleeping && !idle;
+                bool clockChanged = reset || activeClockVersion != nextClockVersion || waking;
+                if (clockChanged || idle)
                 {
                     clock.Reset();
                     lastTick = Stopwatch.GetTimestamp();
                     activeClockVersion = nextClockVersion;
                 }
                 long now = Stopwatch.GetTimestamp();
-                clock.BeginFrame(nextPaused || nextSuspended ? 0 : Stopwatch.GetElapsedTime(lastTick, now).TotalSeconds);
+                clock.BeginFrame(nextPaused || nextSuspended || idle ? 0
+                    : waking ? PhysicsWorld.Timestep : Stopwatch.GetElapsedTime(lastTick, now).TotalSeconds);
                 lastTick = now;
                 bool advanced = false;
                 long workStart = Stopwatch.GetTimestamp();
-                while (singleStep || (!nextPaused && !nextSuspended && clock.TryTakeStep(Stopwatch.GetElapsedTime(workStart).TotalSeconds)))
+                while (singleStep || (!nextPaused && !nextSuspended && !idle && clock.TryTakeStep(Stopwatch.GetElapsedTime(workStart).TotalSeconds)))
                 {
                     lock (gate)
                     {
@@ -214,6 +222,7 @@ internal sealed class PhysicsWorker : IAsyncDisposable
                     writing.AdapterLuid = world.AdapterLuid;
                     writing.Steps = steps;
                     writing.Paused = nextPaused;
+                    writing.IsSleeping = world.IsSleeping;
                     writing.SlowingDown = clock.IsSlowingDown
                         || (!nextPaused && advanced && Stopwatch.GetElapsedTime(workStart).TotalSeconds > PhysicsWorld.Timestep);
                     lock (gate)
@@ -222,8 +231,9 @@ internal sealed class PhysicsWorker : IAsyncDisposable
                         snapshotPending = true;
                     }
                 }
+                wasSleeping = world.IsSleeping;
                 if (!advanced)
-                    wake.WaitOne(nextPaused || nextSuspended ? Timeout.Infinite
+                    wake.WaitOne(nextPaused || nextSuspended || idle ? Timeout.Infinite
                         : Math.Max(1, (int)Math.Ceiling((PhysicsWorld.Timestep - clock.PendingSeconds) * 1000)));
             }
         }

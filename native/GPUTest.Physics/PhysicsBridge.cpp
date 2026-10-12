@@ -311,15 +311,17 @@ extern "C" __declspec(dllexport) int gp_profile_report(World* world, int frames)
     });
 }
 
-extern "C" __declspec(dllexport) int gp_copy(World* world, BallPose* output, int capacity, int* escaped)
+extern "C" __declspec(dllexport) int gp_copy(World* world, BallPose* output, int capacity, int* escaped, int* sleeping)
 {
     return guarded([&] {
-        if (!world || !escaped || capacity < static_cast<int>(world->balls.size()) || (!output && !world->balls.empty()))
+        if (!world || !escaped || !sleeping || capacity < static_cast<int>(world->balls.size()) || (!output && !world->balls.empty()))
             throw std::invalid_argument("Invalid transform buffer.");
         *escaped = 0;
+        *sleeping = world->cube->isSleeping() ? 1 : 0;
         const PxTransform inverseCube = world->cube->getGlobalPose().getInverse();
         for (size_t index = 0; index < world->balls.size(); ++index)
         {
+            if (*sleeping && !world->balls[index]->isSleeping()) *sleeping = 0;
             const PxTransform pose = world->balls[index]->getGlobalPose();
             if (!pose.isFinite()) throw std::runtime_error("Non-finite ball pose.");
             const PxVec3 local = inverseCube.transform(pose.p);

@@ -22,6 +22,7 @@ internal sealed partial class MainWindow : Form
     private readonly System.Windows.Forms.Timer renderTimer = new() { Interval = 1 };
     private bool paused;
     private bool resizePending;
+    private bool framePending = true;
     private bool shuttingDown;
     private bool shutdownComplete;
     private MouseButtons dragging;
@@ -44,6 +45,7 @@ internal sealed partial class MainWindow : Form
     private bool smokeCallbackQueued;
     private double smokeCallbackMilliseconds;
     private long smokeManualStep = -1;
+    private long smokePhysicsCalls;
     public Exception? Failure { get; private set; }
 
     public MainWindow(bool smokeTest = false, int initialBallCount = DefaultBallCount)
@@ -75,6 +77,7 @@ internal sealed partial class MainWindow : Form
             simulation?.RequestStep();
         };
         viewport.Resize += (_, _) => resizePending = true;
+        viewport.Paint += (_, _) => framePending = true;
         viewport.MouseDown += (_, args) => { dragging = args.Button; previousMouse = args.Location; viewport.Capture = true; viewport.Focus(); };
         viewport.MouseUp += (_, _) => { dragging = MouseButtons.None; viewport.Capture = false; };
         viewport.MouseCaptureChanged += (_, _) => { if (!viewport.Capture) dragging = MouseButtons.None; };
@@ -171,6 +174,7 @@ internal sealed partial class MainWindow : Form
 
     private void BeforeSmokeStep()
     {
+        Interlocked.Increment(ref smokePhysicsCalls);
         if (Interlocked.Exchange(ref smokeBlockRequested, 0) == 0) return;
         Volatile.Write(ref smokeBlockStart, Stopwatch.GetTimestamp());
         smokeStepBlocked.Set();
@@ -185,7 +189,7 @@ internal sealed partial class MainWindow : Form
             if (simulation.Failure is { } failure) throw failure;
             bool suspended = WindowState == FormWindowState.Minimized || viewport.Width < 2 || viewport.Height < 1;
             simulation.SetSuspended(suspended);
-            if (suspended) return;
+            if (suspended) { framePending = true; return; }
             if (smokeTest && smokeStepBlocked.IsSet && !smokeCallbackQueued)
             {
                 smokeCallbackQueued = true;
@@ -196,7 +200,13 @@ internal sealed partial class MainWindow : Form
                     smokeReleaseStep.Set();
                 });
             }
-            if (simulation.TrySwapSnapshot(ref snapshot)) slowMotionSinceStatus |= snapshot.SlowingDown;
+            long previousSteps = snapshot.Steps;
+            int previousGeneration = snapshot.Generation;
+            if (simulation.TrySwapSnapshot(ref snapshot))
+            {
+                framePending |= snapshot.Steps != previousSteps || snapshot.Generation != previousGeneration;
+                slowMotionSinceStatus |= snapshot.SlowingDown;
+            }
             if (snapshot.Generation != generation) return;
             UseWaitCursor = false;
             if (renderer is null || resizePending || renderer.AdapterLuid != snapshot.AdapterLuid)
@@ -205,14 +215,19 @@ internal sealed partial class MainWindow : Form
                 renderer = null;
                 renderer = new GpuRenderer(viewport.Handle, viewport.Width, viewport.Height, snapshot.AdapterLuid);
                 resizePending = false;
+                framePending = true;
             }
-            if (!renderer.TryRender(snapshot.Poses, snapshot.CubePosition, snapshot.CubeOrientation)) return;
-            if (smokeTest) RunSmokeFrame();
-            frames++;
+            bool rendered = framePending && renderer.TryRender(snapshot.Poses, snapshot.CubePosition, snapshot.CubeOrientation);
+            if (rendered)
+            {
+                framePending = false;
+                frames++;
+            }
+            if (smokeTest) RunSmokeFrame(rendered);
             double statusElapsed = Stopwatch.GetElapsedTime(lastStatusTick).TotalSeconds;
             if (statusElapsed >= 0.5)
             {
-                string state = paused ? "Paused" : slowMotionSinceStatus ? "Slow motion (physics overload)" : "Running";
+                string state = paused ? "Paused" : snapshot.IsSleeping ? "Idle" : slowMotionSinceStatus ? "Slow motion (physics overload)" : "Running";
                 double simulationRate = (snapshot.Steps - lastStatusSteps) * PhysicsWorld.Timestep / statusElapsed;
                 status.Text = $"{state}   |   {snapshot.Poses.Length:N0} balls   |   {frames / statusElapsed:F1} render FPS   |   sim {simulationRate:F2}x   |   1 GPU: {renderer.DeviceName}";
                 frames = 0;
@@ -224,10 +239,11 @@ internal sealed partial class MainWindow : Form
         catch (Exception exception) { Fail(exception); }
     }
 
-    private void RunSmokeFrame()
+    private void RunSmokeFrame(bool rendered)
     {
+        if (smokeFrame >= 385) return;
         smokeFrame++;
-        if (smokeDragStart != 0 && smokeDragMilliseconds < 0
+        if (rendered && smokeDragStart != 0 && smokeDragMilliseconds < 0
             && Vector3.DistanceSquared(snapshot.CubePosition, targetPosition) < 0.000001f
             && MathF.Abs(Quaternion.Dot(snapshot.CubeOrientation, targetOrientation)) > 0.99999f)
             smokeDragMilliseconds = Stopwatch.GetElapsedTime(smokeDragStart).TotalMilliseconds;
@@ -278,8 +294,96 @@ internal sealed partial class MainWindow : Form
             Console.WriteLine($"PASS: UI callback during blocked physics step ({smokeCallbackMilliseconds:F1}ms), {subsequentSteps} subsequent steps, sustained movement, resize, count reset, pause and exact single-step.");
             if (initialBallCount <= 1000)
                 Console.WriteLine($"PASS: {initialBallCount} balls, mouse-handler input to matching render submission={smokeDragMilliseconds:F1}ms (not display scanout latency).");
+            _ = RunIdleSmokeAsync();
+        }
+    }
+
+    private async Task RunIdleSmokeAsync()
+    {
+        async Task WaitForAsync(Func<bool> condition, string operation)
+        {
+            long start = Stopwatch.GetTimestamp();
+            while (!condition())
+            {
+                if (shuttingDown) throw new OperationCanceledException("Idle check window closed.");
+                if (Stopwatch.GetElapsedTime(start).TotalSeconds > 30)
+                    throw new TimeoutException($"Idle check timed out: {operation}.");
+                await Task.Delay(10);
+            }
+        }
+
+        async Task CheckQuietAsync()
+        {
+            long calls = Volatile.Read(ref smokePhysicsCalls);
+            var submissions = renderer!.FrameId;
+            await Task.Delay(350);
+            if (Volatile.Read(ref smokePhysicsCalls) != calls || renderer.FrameId != submissions)
+                throw new InvalidOperationException("Sleeping/paused scene continued submitting physics or rendering work.");
+        }
+
+        try
+        {
+            SetPaused(false);
+            await WaitForAsync(() => !snapshot.Paused && snapshot.IsSleeping && !framePending, "natural settling");
+            targetOrientation = -targetOrientation;
+            PublishTarget();
+            await CheckQuietAsync();
+
+            long callsBeforeResize = Volatile.Read(ref smokePhysicsCalls);
+            var previousRenderer = renderer;
+            ClientSize = new Size(1100, 760);
+            await WaitForAsync(() => renderer != previousRenderer && renderer!.FrameId > 0 && !framePending, "idle resize");
+            var framesBeforePaint = renderer!.FrameId;
+            viewport.Invalidate();
+            await WaitForAsync(() => renderer.FrameId > framesBeforePaint && !framePending, "idle repaint");
+            if (Volatile.Read(ref smokePhysicsCalls) != callsBeforeResize)
+                throw new InvalidOperationException("Resize or repaint woke sleeping physics.");
+            await CheckQuietAsync();
+
+            SetPaused(true);
+            await WaitForAsync(() => snapshot.Paused && !framePending, "idle pause");
+            long stepsBeforeManual = snapshot.Steps;
+            long callsBeforeManual = Volatile.Read(ref smokePhysicsCalls);
+            var framesBeforeManual = renderer.FrameId;
+            simulation!.RequestStep();
+            await WaitForAsync(() => snapshot.Steps == stepsBeforeManual + 1 && !framePending
+                && renderer.FrameId > framesBeforeManual, "idle single-step");
+            if (Volatile.Read(ref smokePhysicsCalls) != callsBeforeManual + 1)
+                throw new InvalidOperationException("Sleeping scene did not execute exactly one requested step.");
+            await CheckQuietAsync();
+            SetPaused(false);
+            await WaitForAsync(() => !snapshot.Paused && snapshot.IsSleeping && !framePending, "idle resume");
+
+            var framesBeforeMovement = renderer.FrameId;
+            long stepsBeforeMovement = snapshot.Steps;
+            dragging = MouseButtons.Left;
+            previousMouse = new Point(100, 100);
+            MoveCube(viewport, new MouseEventArgs(MouseButtons.Left, 0, 104, 98, 0));
+            dragging = MouseButtons.Right;
+            MoveCube(viewport, new MouseEventArgs(MouseButtons.Right, 0, 106, 99, 0));
+            dragging = MouseButtons.None;
+            await WaitForAsync(() => snapshot.Steps > stepsBeforeMovement && !framePending
+                && renderer.FrameId > framesBeforeMovement && snapshot.CubePosition == targetPosition
+                && MathF.Abs(Quaternion.Dot(snapshot.CubeOrientation, targetOrientation)) > 0.99999f, "mouse wake");
+            long stepsAfterMovement = snapshot.Steps;
+            await WaitForAsync(() => snapshot.Steps >= stepsAfterMovement + 4, "balls moving after mouse release");
+            SetPaused(true);
+            await WaitForAsync(() => snapshot.Paused && !framePending, "pause moving balls");
+            await CheckQuietAsync();
+
+            ResetSimulation();
+            await WaitForAsync(() => snapshot.Generation == generation && !snapshot.Paused
+                && snapshot.Steps > stepsBeforeManual + 1 && snapshot.IsSleeping && !framePending, "idle reset");
+            await CheckQuietAsync();
+            using var screenshot = renderer.Capture();
+            screenshot.Save("artifacts/idle-smoke.png");
+            Console.WriteLine("PASS: naturally sleeping scene submits zero physics steps and zero render frames across 350ms quiet intervals; equivalent target stays idle; resize/repaint redraw without physics; mouse, exact single-step and reset wake correctly.");
             renderTimer.Stop();
             BeginInvoke(Close);
+        }
+        catch (Exception exception)
+        {
+            if (!shuttingDown) Fail(exception);
         }
     }
 
