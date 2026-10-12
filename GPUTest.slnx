@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GPUTest.App/GPUTest.App.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GPUTest.Tests/GPUTest.Tests.csproj" />
+  </Folder>
+</Solution>

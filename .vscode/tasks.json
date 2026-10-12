@@ -1,0 +1,33 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build GPUTest",
+      "type": "process",
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}/scripts/build.ps1"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": "$msCompile",
+      "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "Test GPUTest",
+      "type": "process",
+      "command": "dotnet",
+      "args": ["test", "GPUTest.slnx", "-c", "Release"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "dependsOn": "Build GPUTest",
+      "problemMatcher": "$msCompile",
+      "group": "test"
+    },
+    {
+      "label": "Probe dual-GPU rendering",
+      "type": "process",
+      "command": "dotnet",
+      "args": ["run", "--project", "src/GPUTest.App", "-c", "Release", "--no-build", "--", "--render-probe"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "dependsOn": "Build GPUTest",
+      "problemMatcher": []
+    }
+  ]
+}
