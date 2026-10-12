@@ -304,25 +304,27 @@ public sealed class PhysicsTests
         Assert.True(MathF.Abs(Quaternion.Dot(controller.Orientation, Quaternion.Normalize(controller.TargetOrientation))) > 0.99999f);
     }
 
-    [Fact]
-    public void DenseSceneControllerRetainsMotionSafetyLimits()
+    [Theory]
+    [InlineData(10)]
+    [InlineData(1000)]
+    [InlineData(1001)]
+    [InlineData(10000)]
+    [InlineData(100000)]
+    public async Task WorkerAppliesPointerTargetInOneStepForEverySceneSize(int count)
     {
-        var controller = new CubeController(directTracking: false)
+        await using var worker = new PhysicsWorker(count, true, size => new TestPhysicsWorld(size));
+        var snapshot = await NextSnapshot(worker, value => value.Paused);
+        foreach (float direction in new[] { 1f, -1f, 0f })
         {
-            TargetPosition = new Vector3(2, 0, 0),
-            TargetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitY, 1)
-        };
-        for (int step = 0; step < 360; step++)
-        {
-            Vector3 previous = controller.Position;
-            Quaternion rotation = controller.Orientation;
-            controller.Advance();
-            Assert.InRange(Vector3.Distance(previous, controller.Position), 0, CubeController.MaximumLinearSpeed * PhysicsWorld.Timestep + 0.0001f);
-            float angle = 2 * MathF.Acos(Math.Clamp(MathF.Abs(Quaternion.Dot(rotation, controller.Orientation)), 0, 1));
-            Assert.InRange(angle, 0, CubeController.MaximumAngularSpeed * PhysicsWorld.Timestep + 0.001f);
+            Vector3 position = new(direction * 2, direction * 0.5f, 0);
+            Quaternion orientation = Quaternion.CreateFromAxisAngle(Vector3.UnitY, direction);
+            long expectedStep = snapshot.Steps + 1;
+            worker.SetTarget(position, orientation);
+            worker.RequestStep();
+            snapshot = await NextSnapshot(worker, value => value.Paused && value.Steps == expectedStep, snapshot);
+            Assert.Equal(position, snapshot.CubePosition);
+            Assert.True(MathF.Abs(Quaternion.Dot(orientation, snapshot.CubeOrientation)) > 0.99999f);
         }
-        Assert.Equal(controller.TargetPosition, controller.Position);
-        Assert.True(MathF.Abs(Quaternion.Dot(controller.Orientation, controller.TargetOrientation)) > 0.99999f);
     }
 
     [Fact]

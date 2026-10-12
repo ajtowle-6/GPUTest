@@ -7,8 +7,10 @@ namespace GPUTest.App;
 
 internal sealed partial class MainWindow : Form
 {
+    internal const int DefaultBallCount = 1_000;
+
     private readonly Panel viewport = new() { Dock = DockStyle.Fill, BackColor = Color.FromArgb(14, 17, 18), TabStop = true };
-    private readonly NumericUpDown count = new() { Minimum = 0, Maximum = 100_000, Increment = 1_000, Value = 10_000, ThousandsSeparator = true, Width = 110 };
+    private readonly NumericUpDown count = new() { Minimum = 0, Maximum = 100_000, Increment = 1_000, Value = DefaultBallCount, ThousandsSeparator = true, Width = 110 };
     private readonly Button pause = new() { Text = "Pause", AutoSize = true };
     private readonly ToolStripStatusLabel status = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
     private PhysicsWorker? simulation;
@@ -44,7 +46,7 @@ internal sealed partial class MainWindow : Form
     private long smokeManualStep = -1;
     public Exception? Failure { get; private set; }
 
-    public MainWindow(bool smokeTest = false, int initialBallCount = 10_000)
+    public MainWindow(bool smokeTest = false, int initialBallCount = DefaultBallCount)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(initialBallCount);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(initialBallCount, 100_000);
@@ -242,7 +244,7 @@ internal sealed partial class MainWindow : Form
         }
         if (smokeFrame == 20)
         {
-            if (initialBallCount <= CubeController.DirectTrackingBallLimit
+            if (initialBallCount <= 1000
                 && (smokeDragMilliseconds < 0 || smokeDragMilliseconds > 100))
                 throw new InvalidOperationException($"Direct mouse tracking failed: input-to-render submission={smokeDragMilliseconds:F1}ms.");
             smokeStartSteps = snapshot.Steps;
@@ -274,7 +276,7 @@ internal sealed partial class MainWindow : Form
             using var screenshot = renderer!.Capture();
             screenshot.Save("artifacts/ui-smoke.png");
             Console.WriteLine($"PASS: UI callback during blocked physics step ({smokeCallbackMilliseconds:F1}ms), {subsequentSteps} subsequent steps, sustained movement, resize, count reset, pause and exact single-step.");
-            if (initialBallCount <= CubeController.DirectTrackingBallLimit)
+            if (initialBallCount <= 1000)
                 Console.WriteLine($"PASS: {initialBallCount} balls, mouse-handler input to matching render submission={smokeDragMilliseconds:F1}ms (not display scanout latency).");
             renderTimer.Stop();
             BeginInvoke(Close);

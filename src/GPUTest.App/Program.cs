@@ -109,9 +109,11 @@ internal static partial class Program
             if (args.Length == 0 || args.Contains("--ui-smoke") || args[0] == "--balls")
             {
                 if (args.Length == 1 && args[0] == "--balls") throw new ArgumentException("--balls requires a count from 0 to 100000.");
-                int initialCount = args.Length > 1 && args[0] is "--balls" or "--ui-smoke" ? int.Parse(args[1]) : 10_000;
+                bool smokeTest = args.Contains("--ui-smoke");
+                int initialCount = args.Length > 1 && args[0] is "--balls" or "--ui-smoke"
+                    ? int.Parse(args[1]) : smokeTest ? 10_000 : MainWindow.DefaultBallCount;
                 ApplicationConfiguration.Initialize();
-                using var window = new MainWindow(args.Contains("--ui-smoke"), initialCount);
+                using var window = new MainWindow(smokeTest, initialCount);
                 Application.Run(window);
                 if (window.Failure is not null) throw window.Failure;
                 return 0;

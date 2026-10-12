@@ -170,7 +170,7 @@ internal sealed class PhysicsWorker : IAsyncDisposable
                     world?.Dispose();
                     world = null;
                     world = createWorld(nextCount);
-                    cube = new CubeController(nextCount <= CubeController.DirectTrackingBallLimit);
+                    cube = new CubeController();
                     activeGeneration = nextGeneration;
                 }
                 bool clockChanged = reset || activeClockVersion != nextClockVersion;

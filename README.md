@@ -16,6 +16,8 @@ On this workstation, dependencies have already been restored and the native brid
 dotnet run --project src/GPUTest.App -c Release
 ```
 
+Normal launches start with 1,000 balls. Explicit counts and diagnostic defaults are unchanged.
+
 To start directly with ten balls:
 
 ```powershell
@@ -51,7 +53,7 @@ For incremental builds after dependencies are restored:
 | Pause / Resume | Pause or resume simulation |
 | Step | Pause and advance one 1/120-second step |
 
-Mouse translation uses the camera's projected scale at the cube's current depth, so cursor and target displacement match on screen even after resizing. Scenes with **0-1,000 balls apply the latest translation and rotation target on the next physics tick**, without the old speed/acceleration easing. Scenes above 1,000 balls retain the tested limits of 10 m/s translation, 80 m/s^2 translational acceleration and 1 rad/s rotation: unrestricted dense-scene motion failed the UI progress/overflow gates. This is a conservative supported boundary, not a fundamental PhysX limit. Cube center remains limited to +/-4 m along each world axis. The camera is fixed for now.
+Mouse translation uses the camera's projected scale at the cube's current depth, so cursor and target displacement match on screen even after resizing. **All scenes, from 0 to 100,000 balls, apply the latest translation and rotation target on the next physics tick.** There is no ball-count cutoff, translation-speed cap, acceleration easing or rotation-speed cap. Cube center remains limited to +/-4 m along each world axis. The camera is fixed for now. Removing the dense-scene limits does not make physics faster: earlier unrestricted dense-scene trials failed progress or overflow checks, and heavy scenes can still slow down or stop with a collision error.
 
 Large wall movements and fast balls trigger additional PhysX substeps within the same 1/120-second outer tick. Substep duration is bounded by relative wall/ball travel over the 0.5 m wall thickness, with velocity rechecked after each substep. No balls are teleported with the cube, and the renderer still displays cube and balls from the same completed physical state. Solver iterations, friction, restitution and speculative CCD are unchanged. Arbitrary extreme motion or a heavily loaded GPU can still exceed the simulation budget; this is not a zero-latency or universal containment guarantee.
 
@@ -74,11 +76,12 @@ dotnet run --project src/GPUTest.App -c Release -- --render-probe --gpu-validati
 dotnet run --project src/GPUTest.App -c Release -- --ui-smoke
 dotnet run --project src/GPUTest.App -c Release -- --ui-smoke 10
 dotnet run --project src/GPUTest.App -c Release -- --ui-smoke 1000
+dotnet run --project src/GPUTest.App -c Release -- --ui-smoke 1001
 dotnet run --project src/GPUTest.App -c Release -- --physics-benchmark 100000 120
 dotnet run --project src/GPUTest.App -c Release -- --benchmark 100000 120
 ```
 
-Twenty-nine test cases cover native pose layout, invalid ball/worker counts, direct next-tick tracking, target coalescing, dense-scene motion limits, fast drag/reversal response, screen-space drag mapping, overload scheduling/recovery, cube sleep/wake, GPU scene destruction/recreation, settling and moving/rotating containment. Worker tests cover commands during a blocked step, stable snapshots, reset generations and their GPU identity, queued single-steps, failure propagation and shutdown without disposing an in-flight world. Native recreation tests require a nonzero adapter LUID. Additional tests compare physical trajectories with query participation on/off and exercise repeated profiling start/stop. The rapid-motion containment test covers 10, 1,000 and 10,000 balls with direct controller targets. GPU tests require the native runtime and an NVIDIA GPU and are not silently skipped.
+Thirty-three test cases cover native pose layout, invalid ball/worker counts, direct next-tick tracking, target coalescing, fast drag/reversal response, screen-space drag mapping, overload scheduling/recovery, cube sleep/wake, GPU scene destruction/recreation, settling and moving/rotating containment. Worker tests cover commands during a blocked step, stable snapshots, reset generations and their GPU identity, queued single-steps, failure propagation and shutdown without disposing an in-flight world. Direct worker tracking is tested at 10, 1,000, 1,001, 10,000 and 100,000 balls using a test world; this verifies input routing, not real GPU throughput at those counts. Native recreation tests require a nonzero adapter LUID. Additional tests compare physical trajectories with query participation on/off and exercise repeated profiling start/stop. The rapid-motion containment test covers 10, 1,000 and 10,000 balls with direct controller targets. GPU tests require the native runtime and an NVIDIA GPU and are not silently skipped.
 
 The adapter probe creates one D3D12 device on the PhysX GPU and reports its matching LUID. The finite rendering probe opens a window, renders 30 frames across all resource slots, and checks scene pixels in both halves of an actual GPU backbuffer capture. Both image halves come from the same rendering device. It writes `artifacts/render-probe.png`, independent of desktop occlusion. The 385-frame UI smoke test defaults to 10,000 balls (optional count argument), injects an initial translation/rotation through the mouse handler, exercises sustained motion and deliberately blocks a physics step until a UI callback releases it. That callback must run within 250 ms; continued physics, resizing, count reset, pause and exactly one requested step are also required. It writes a viewport capture to `artifacts/ui-smoke.png`. Small-scene runs additionally require the initial mouse-handler target to reach a matching render submission within 100 ms. These are not hardware input-to-photon measurements, exhaustive mouse-input tests or long soak tests.
 
@@ -117,7 +120,11 @@ dotnet build GPUTest.slnx -c Release
 
 ## Measured Results
 
-### Small-Scene Mouse Fix (2026-10-12)
+### Motion Limits Removed (2026-10-12)
+
+The ball-count-based controller limits have been removed at the user's request. All 33 tests pass. The 1,001-ball GPU UI smoke test passes above the former cutoff, including a 0.9 ms callback during a blocked physics step and 653 subsequent steps, sustained motion, resize, reset, pause and single-step. Collision substeps, error detection and the world-position boundary remain active. No large-scene real-time performance claim is made; the existing heavy-scene progress and overflow checks have not been relaxed.
+
+### Historical Small-Scene Mouse Fix (2026-10-12)
 
 The old controller advanced only 0.0054 m toward a 2 m target on its first tick, even with no physics load. The new direct-tracking regression reaches the exact target on the next tick. All 29 tests pass. UI smoke runs measured 31.1 ms with 10 balls and 74.9 ms with 1,000 balls from mouse-handler input to submission of the matching physical snapshot; both completed sustained movement, resize, reset, pause and single-step checks. The 10,000-ball compatibility run retained its motion limits and passed with a 12.7 ms blocked-step callback and 301 subsequent physics steps. These timings are individual initial-drag samples, not latency percentiles or display scanout timings.
 
@@ -191,7 +198,7 @@ PhysX is pinned to tag `106.1-physx-5.4.2`, commit `19542b61c4fee8e5aaa97f104559
 
 ## Next Gate
 
-The isolated combined run confirms that physics/pose work dominates at 100k; rendering-only optimization cannot recover the required budget. The host profile suggests contact-island maintenance and speculative contact-distance updates as areas to investigate, but that instrumented capture predates workload isolation and its inclusive zone totals are not GPU timings. Obtain a GPU/CPU timeline before choosing a larger simulation change. Keep future comparisons free of competing GPU-memory workloads, and retest correctness with the same trace after each change. Keep the dense-scene controller limits until fast-motion containment and throughput are demonstrated; do not hide lag by moving the displayed cube ahead of its physical state.
+The isolated combined run confirms that physics/pose work dominates at 100k; rendering-only optimization cannot recover the required budget. The host profile suggests contact-island maintenance and speculative contact-distance updates as areas to investigate, but that instrumented capture predates workload isolation and its inclusive zone totals are not GPU timings. Obtain a GPU/CPU timeline before choosing a larger simulation change. Keep future comparisons free of competing GPU-memory workloads, and retest correctness with the same trace after each change. Direct tracking is now enabled for all counts by request; further work is needed on dense-scene fast-motion throughput and containment. Do not hide lag by moving the displayed cube ahead of its physical state.
 
 The direct-GPU PhysX API is a possible later optimization, but it disables standard CCD and CPU pose APIs. It must not be enabled without redesigning/testing fast-motion containment and pose transfer. Reducing solver fidelity, replacing rigid bodies with particles, or lowering the required 100k count requires an explicit decision.
 
