@@ -2,8 +2,9 @@ using System.Numerics;
 
 namespace GPUTest.App.Simulation;
 
-internal sealed class CubeController
+internal sealed class CubeController(bool directTracking = true)
 {
+    public const int DirectTrackingBallLimit = 1000;
     public const float MaximumLinearSpeed = 10;
     public const float MaximumLinearAcceleration = 80;
     public const float MaximumAngularSpeed = 1;
@@ -16,10 +17,15 @@ internal sealed class CubeController
 
     public void Advance()
     {
+        if (directTracking)
+        {
+            Position = TargetPosition;
+            Orientation = Quaternion.Normalize(TargetOrientation);
+            return;
+        }
         float timestep = PhysicsWorld.Timestep;
         Vector3 displacement = TargetPosition - Position;
-        Vector3 desiredVelocity = displacement / timestep;
-        desiredVelocity = Limit(desiredVelocity, MaximumLinearSpeed);
+        Vector3 desiredVelocity = Limit(displacement / timestep, MaximumLinearSpeed);
         velocity += Limit(desiredVelocity - velocity, MaximumLinearAcceleration * timestep);
         Vector3 movement = velocity * timestep;
         if (movement.LengthSquared() > displacement.LengthSquared())

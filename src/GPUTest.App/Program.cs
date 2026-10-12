@@ -35,11 +35,13 @@ internal static partial class Program
                 if (measuredFrames is < 1 or > 36000) throw new ArgumentOutOfRangeException(nameof(measuredFrames));
                 int warmup = benchmark ? 120 : 0;
                 double[] timings = new double[measuredFrames];
+                double physicsMilliseconds = 0;
+                double renderingMilliseconds = 0;
                 ApplicationConfiguration.Initialize();
-                using var window = new Form { Text = "GPUTest | Dual-GPU rendering probe", ClientSize = benchmark ? new Size(2560, 1440) : new Size(1280, 720), TopMost = true, FormBorderStyle = FormBorderStyle.FixedSingle, MaximizeBox = false };
+                using var window = new Form { Text = "GPUTest | Single-GPU rendering probe", ClientSize = benchmark ? new Size(2560, 1440) : new Size(1280, 720), TopMost = true, FormBorderStyle = FormBorderStyle.FixedSingle, MaximizeBox = false };
                 window.Show();
-                using var renderer = new DualGpuRenderer(window.Handle, window.ClientSize.Width, window.ClientSize.Height);
                 using var world = new PhysicsWorld(ballCount);
+                using var renderer = new GpuRenderer(window.Handle, window.ClientSize.Width, window.ClientSize.Height, world.AdapterLuid);
                 for (int frame = 0; frame < measuredFrames + warmup; frame++)
                 {
                     Application.DoEvents();
@@ -59,19 +61,30 @@ internal static partial class Program
                     }
                     world.CopyPoses();
                     if (world.Escaped != 0) throw new InvalidOperationException($"Containment failed: {world.Escaped} escaped balls.");
+                    long renderStart = Stopwatch.GetTimestamp();
                     renderer.Render(world.Poses, translation, rotation);
-                    if (frame >= warmup) timings[frame - warmup] = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                    if (frame >= warmup)
+                    {
+                        double elapsed = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                        double physicsElapsed = Stopwatch.GetElapsedTime(start, renderStart).TotalMilliseconds;
+                        timings[frame - warmup] = elapsed;
+                        physicsMilliseconds += physicsElapsed;
+                        renderingMilliseconds += elapsed - physicsElapsed;
+                    }
                 }
                 if (benchmark)
                 {
                     long drainStart = Stopwatch.GetTimestamp();
                     renderer.WaitIdle();
-                    timings[^1] += Stopwatch.GetElapsedTime(drainStart).TotalMilliseconds;
+                    double drainMilliseconds = Stopwatch.GetElapsedTime(drainStart).TotalMilliseconds;
+                    timings[^1] += drainMilliseconds;
+                    renderingMilliseconds += drainMilliseconds;
                     Array.Sort(timings);
                     double average = timings.Average();
                     double p95 = timings[(int)((measuredFrames - 1) * 0.95)];
                     bool targetMet = average <= 1000.0 / 60 && p95 <= 20;
-                    Console.WriteLine($"COMBINED: {ballCount:N0} balls, {window.ClientSize.Width}x{window.ClientSize.Height}, 2 GPUs, {measuredFrames} measured frames, average={average:F2}ms, p95={p95:F2}ms, FPS={1000 / average:F2}, realtime-factor={1000 / 60 / average:F2}, escaped=0");
+                    Console.WriteLine($"COMBINED: {ballCount:N0} balls, {window.ClientSize.Width}x{window.ClientSize.Height}, 1 GPU [{renderer.AdapterLuid}], {measuredFrames} measured frames, average={average:F2}ms, p95={p95:F2}ms, FPS={1000 / average:F2}, realtime-factor={1000 / 60 / average:F2}, escaped=0");
+                    Console.WriteLine($"BREAKDOWN: physics + poses={physicsMilliseconds / measuredFrames:F2}ms, render submission + waits/presentation={renderingMilliseconds / measuredFrames:F2}ms per frame (not GPU kernel timings)");
                     Console.WriteLine($"60 FPS performance gate: {(targetMet ? "MET for this short run" : "NOT MET")}. Visuals are the wireframe prototype, not the final glass renderer.");
                     return 0;
                 }
@@ -87,23 +100,29 @@ internal static partial class Program
                             Color pixel = screenshot.GetPixel(horizontal, vertical);
                             if (pixel.R > 50 || pixel.G > 50 || pixel.B > 50) coloredPixels++;
                         }
-                    if (coloredPixels < 100) throw new InvalidOperationException($"GPU region {region} appears blank ({coloredPixels} scene pixels).");
-                    Console.WriteLine($"GPU region {region}: {coloredPixels} sampled non-background pixels.");
+                    if (coloredPixels < 100) throw new InvalidOperationException($"Image half {region} appears blank ({coloredPixels} scene pixels).");
+                    Console.WriteLine($"Image half {region}: {coloredPixels} sampled non-background pixels.");
                 }
-                Console.WriteLine($"PASS: {renderer.FrameId} frames composed from two GPU render targets.");
+                Console.WriteLine($"PASS: {renderer.FrameId} full-width frames; physics and rendering on one GPU [{renderer.AdapterLuid}].");
                 return 0;
             }
-            if (args.Length == 0 || args.Contains("--ui-smoke"))
+            if (args.Length == 0 || args.Contains("--ui-smoke") || args[0] == "--balls")
             {
+                if (args.Length == 1 && args[0] == "--balls") throw new ArgumentException("--balls requires a count from 0 to 100000.");
+                int initialCount = args.Length > 1 && args[0] is "--balls" or "--ui-smoke" ? int.Parse(args[1]) : 10_000;
                 ApplicationConfiguration.Initialize();
-                using var window = new MainWindow(args.Contains("--ui-smoke"));
+                using var window = new MainWindow(args.Contains("--ui-smoke"), initialCount);
                 Application.Run(window);
                 if (window.Failure is not null) throw window.Failure;
                 return 0;
             }
             if (args.Length > 0 && args[0] == "--physics-benchmark")
             {
-                PhysicsBenchmark.Run(args.Length > 1 ? int.Parse(args[1]) : 10_000, args.Length > 2 ? int.Parse(args[2]) : 300);
+                int workersOption = Array.IndexOf(args, "--workers");
+                if (workersOption == args.Length - 1) throw new ArgumentException("--workers requires a count from 0 to 64.");
+                int workers = workersOption < 0 ? 4 : int.Parse(args[workersOption + 1]);
+                PhysicsBenchmark.Run(args.Length > 1 ? int.Parse(args[1]) : 10_000, args.Length > 2 ? int.Parse(args[2]) : 300,
+                    args.Contains("--profile"), workers, args.Contains("--queries"));
                 return 0;
             }
             if (args.Contains("--physics-probe"))
@@ -114,26 +133,24 @@ internal static partial class Program
                 return 0;
             }
             if (args.Length != 1 || args[0] != "--probe")
-                throw new ArgumentException("Use no arguments for the UI, or --probe, --physics-probe, --render-probe, --ui-smoke, --physics-benchmark [balls] [frames], --benchmark [balls] [frames].");
+                throw new ArgumentException("Use no arguments or --balls <count> for the UI, or --probe, --physics-probe, --render-probe, --ui-smoke [balls], --physics-benchmark [balls] [frames] [--workers 0..64] [--queries] [--profile], --benchmark [balls] [frames].");
             using IDXGIFactory4 factory = DXGI.CreateDXGIFactory1<IDXGIFactory4>();
-            int count = 0;
+            using var probeWorld = new PhysicsWorld(0);
             for (uint index = 0; factory.EnumAdapters1(index, out IDXGIAdapter1 adapter).Success; index++)
             {
                 using (adapter)
                 {
                     AdapterDescription1 description = adapter.Description1;
-                    if ((description.Flags & AdapterFlags.Software) != 0 || description.VendorId != 0x10DE)
+                    if (description.Luid != probeWorld.AdapterLuid || (description.Flags & AdapterFlags.Software) != 0 || description.VendorId != 0x10DE)
                         continue;
                     using ID3D12Device device = D3D12.D3D12CreateDevice<ID3D12Device>(adapter, FeatureLevel.Level_12_0);
-                    Console.WriteLine($"GPU {count}: {description.Description.Trim()} | LUID {description.Luid} | {description.DedicatedVideoMemory / (1024 * 1024)} MiB | D3D12 ready");
-                    count++;
+                    Console.WriteLine($"GPU: {description.Description.Trim()} | LUID {description.Luid} | {description.DedicatedVideoMemory / (1024 * 1024)} MiB | D3D12 ready");
+                    Console.WriteLine("PASS: one NVIDIA GPU selected for both PhysX and Direct3D 12.");
+                    return 0;
                 }
             }
 
-            if (count < 2)
-                throw new InvalidOperationException($"Two NVIDIA D3D12 adapters are required; found {count}.");
-            Console.WriteLine("PASS: two independent NVIDIA Direct3D 12 devices created.");
-            return 0;
+            throw new InvalidOperationException($"The PhysX adapter [{probeWorld.AdapterLuid}] is not available for D3D12 rendering.");
         }
         catch (Exception exception)
         {

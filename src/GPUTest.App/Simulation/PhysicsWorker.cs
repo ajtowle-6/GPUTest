@@ -12,6 +12,7 @@ internal sealed class PhysicsSnapshot
     public long Steps { get; set; }
     public bool Paused { get; set; }
     public bool SlowingDown { get; set; }
+    public long AdapterLuid { get; set; }
 }
 
 internal sealed class PhysicsWorker : IAsyncDisposable
@@ -169,7 +170,7 @@ internal sealed class PhysicsWorker : IAsyncDisposable
                     world?.Dispose();
                     world = null;
                     world = createWorld(nextCount);
-                    cube = new CubeController();
+                    cube = new CubeController(nextCount <= CubeController.DirectTrackingBallLimit);
                     activeGeneration = nextGeneration;
                 }
                 bool clockChanged = reset || activeClockVersion != nextClockVersion;
@@ -210,6 +211,7 @@ internal sealed class PhysicsWorker : IAsyncDisposable
                     writing.CubePosition = cube.Position;
                     writing.CubeOrientation = cube.Orientation;
                     writing.Generation = activeGeneration;
+                    writing.AdapterLuid = world.AdapterLuid;
                     writing.Steps = steps;
                     writing.Paused = nextPaused;
                     writing.SlowingDown = clock.IsSlowingDown

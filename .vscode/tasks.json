@@ -21,7 +21,7 @@
       "group": "test"
     },
     {
-      "label": "Probe dual-GPU rendering",
+      "label": "Probe single-GPU rendering",
       "type": "process",
       "command": "dotnet",
       "args": ["run", "--project", "src/GPUTest.App", "-c", "Release", "--no-build", "--", "--render-probe"],

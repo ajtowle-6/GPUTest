@@ -1,12 +1,14 @@
 #include "PxPhysicsAPI.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace physx;
@@ -44,10 +46,50 @@ namespace
         }
     };
 
+    struct Profiler final : PxProfilerCallback
+    {
+        using Clock = std::chrono::steady_clock;
+        struct Zone { double milliseconds = 0; uint64_t calls = 0; };
+        std::mutex mutex;
+        std::unordered_map<std::string, Zone> zones;
+
+        void* zoneStart(const char*, bool detached, uint64_t) override
+        {
+            if (detached) return nullptr;
+            return reinterpret_cast<void*>(static_cast<uintptr_t>(Clock::now().time_since_epoch().count()));
+        }
+
+        void zoneEnd(void* data, const char* name, bool detached, uint64_t) override
+        {
+            if (detached || !data) return;
+            const auto start = Clock::duration(static_cast<Clock::rep>(reinterpret_cast<uintptr_t>(data)));
+            const double elapsed = std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch() - start).count();
+            std::lock_guard<std::mutex> guard(mutex);
+            auto& zone = zones[name];
+            zone.milliseconds += elapsed;
+            ++zone.calls;
+        }
+
+        void report(int frames)
+        {
+            std::vector<std::pair<std::string, Zone>> ordered(zones.begin(), zones.end());
+            std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
+                return left.second.milliseconds > right.second.milliseconds;
+            });
+            std::printf("HOST PROFILE: synchronous inclusive/overlapping zones; not GPU kernel timings; %d measured frames\n", frames);
+            for (size_t index = 0; index < std::min<size_t>(ordered.size(), 20); ++index)
+                std::printf("  %8.3f ms/frame | %8llu calls | %s\n", ordered[index].second.milliseconds / frames,
+                    static_cast<unsigned long long>(ordered[index].second.calls), ordered[index].first.c_str());
+            if (ordered.empty()) std::printf("  No instrumented zones available in this PhysX build.\n");
+        }
+    };
+
     struct World
     {
+        static constexpr float wallThickness = 0.5f;
         PxDefaultAllocator allocator;
         Errors errors;
+        Profiler profiler;
         PxFoundation* foundation = nullptr;
         PxCudaContextManager* cuda = nullptr;
         PxPhysics* physics = nullptr;
@@ -62,6 +104,7 @@ namespace
 
         ~World()
         {
+            if (PxGetProfilerCallback() == &profiler) PxSetProfilerCallback(nullptr);
             if (scene) scene->release();
             for (auto* ball : balls) ball->release();
             if (cube) cube->release();
@@ -72,10 +115,11 @@ namespace
             if (foundation) foundation->release();
         }
 
-        void initialize(int count, float size, float ballRadius)
+        void initialize(int count, float size, float ballRadius, int workers, bool sceneQueries)
         {
             if (count < 0 || count > 100000 || !std::isfinite(size) || !std::isfinite(ballRadius) || size < 1 || ballRadius < 0.01f || ballRadius >= size)
                 throw std::invalid_argument("Invalid ball count, cube size or radius.");
+            if (workers < 0 || workers > 64) throw std::invalid_argument("Invalid physics worker count.");
             halfExtent = size;
             radius = ballRadius;
             const float spacing = radius * 2.06f;
@@ -89,7 +133,8 @@ namespace
             if (!cuda || !cuda->contextIsValid()) throw std::runtime_error("A valid PhysX CUDA GPU is required. CPU fallback is disabled.");
             physics = PxCreatePhysics(PX_PHYSICS_VERSION, *foundation, PxTolerancesScale());
             if (!physics) throw std::runtime_error("PhysX creation failed.");
-            dispatcher = PxDefaultCpuDispatcherCreate(4);
+            dispatcher = PxDefaultCpuDispatcherCreate(static_cast<PxU32>(workers));
+            if (!dispatcher) throw std::runtime_error("CPU dispatcher creation failed.");
             PxSceneDesc descriptor(physics->getTolerancesScale());
             descriptor.gravity = PxVec3(0, -9.81f, 0);
             descriptor.cpuDispatcher = dispatcher;
@@ -107,14 +152,16 @@ namespace
             if (!material || !cube) throw std::runtime_error("Cube creation failed.");
             cube->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
             cube->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_SPECULATIVE_CCD, true);
-            const float thickness = 0.25f;
+            PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eVISUALIZATION;
+            if (sceneQueries) shapeFlags |= PxShapeFlag::eSCENE_QUERY_SHAPE;
+            const float thickness = wallThickness / 2;
             for (int axis = 0; axis < 3; ++axis)
             {
                 for (int sign : {-1, 1})
                 {
                     PxVec3 extents(halfExtent + 2 * thickness);
                     extents[axis] = thickness;
-                    PxShape* wall = physics->createShape(PxBoxGeometry(extents), *material, true);
+                    PxShape* wall = physics->createShape(PxBoxGeometry(extents), *material, true, shapeFlags);
                     if (!wall) throw std::runtime_error("Wall shape allocation failed.");
                     PxVec3 position(0);
                     position[axis] = sign * (halfExtent + thickness);
@@ -128,7 +175,7 @@ namespace
             balls.reserve(count);
             std::vector<PxActor*> actors;
             actors.reserve(count);
-            PxShape* sphere = physics->createShape(PxSphereGeometry(radius), *material);
+            PxShape* sphere = physics->createShape(PxSphereGeometry(radius), *material, false, shapeFlags);
             if (!sphere) throw std::runtime_error("Sphere shape allocation failed.");
             sphere->setContactOffset(radius * 0.1f);
             const float span = (side - 1) * spacing;
@@ -151,7 +198,8 @@ namespace
             sphere->release();
             if (!actors.empty()) scene->addActors(actors.data(), static_cast<PxU32>(actors.size()));
             errors.check();
-            std::printf("GPU physics: %s | %d spheres | radius %.3f | cube width %.1f\n", cuda->getDeviceName(), count, radius, halfExtent * 2);
+            std::printf("GPU physics: %s | %d spheres | radius %.3f | cube width %.1f | CPU workers %d | scene queries %s\n",
+                cuda->getDeviceName(), count, radius, halfExtent * 2, workers, sceneQueries ? "on" : "off");
         }
     };
 
@@ -166,18 +214,26 @@ namespace
 
 extern "C" __declspec(dllexport) const char* gp_last_error() { return lastError.c_str(); }
 
-extern "C" __declspec(dllexport) World* gp_create(int count, float halfExtent, float radius)
+extern "C" __declspec(dllexport) World* gp_create(int count, float halfExtent, float radius, int workers, int sceneQueries)
 {
     World* result = nullptr;
     guarded([&] {
         auto world = std::make_unique<World>();
-        world->initialize(count, halfExtent, radius);
+        world->initialize(count, halfExtent, radius, workers, sceneQueries != 0);
         result = world.release();
     });
     return result;
 }
 
 extern "C" __declspec(dllexport) void gp_destroy(World* world) { delete world; }
+
+extern "C" __declspec(dllexport) int gp_device(World* world, int* device)
+{
+    return guarded([&] {
+        if (!world || !device) throw std::invalid_argument("Invalid CUDA device query.");
+        *device = world->cuda->getDevice();
+    });
+}
 
 extern "C" __declspec(dllexport) int gp_step(World* world, float timestep, const float* target)
 {
@@ -186,22 +242,73 @@ extern "C" __declspec(dllexport) int gp_step(World* world, float timestep, const
             throw std::invalid_argument("Invalid physics step.");
         const PxTransform pose(PxVec3(target[0], target[1], target[2]), PxQuat(target[3], target[4], target[5], target[6]));
         if (!pose.isValid()) throw std::invalid_argument("Invalid cube target.");
-        const PxTransform& previous = world->lastCubeTarget;
-        if (pose.p != previous.p || (!(pose.q == previous.q) && !(pose.q == -previous.q)))
+        const PxTransform previous = world->lastCubeTarget;
+        const float angle = 2 * std::acos(std::clamp(std::abs(previous.q.dot(pose.q)), 0.0f, 1.0f));
+        const float travel = (pose.p - previous.p).magnitude() + angle * (world->halfExtent + World::wallThickness) * std::sqrt(3.0f);
+        if (!std::isfinite(travel) || travel > World::wallThickness * 1024)
+            throw std::invalid_argument("Cube movement exceeds the supported step distance.");
+        const float wallSpeed = travel / timestep;
+        float remaining = timestep;
+        while (remaining > 0)
         {
-            world->cube->setKinematicTarget(pose);
-            world->lastCubeTarget = pose;
+            float maximumBallSpeed = 0;
+            for (const auto* ball : world->balls)
+            {
+                const float speed = ball->getLinearVelocity().magnitude();
+                if (!std::isfinite(speed)) throw std::runtime_error("Non-finite ball velocity.");
+                maximumBallSpeed = std::max(maximumBallSpeed, speed);
+            }
+            const float substep = std::min(remaining, World::wallThickness / std::max(1.0f, wallSpeed + maximumBallSpeed));
+            if (substep < 0.000001f && substep < remaining)
+                throw std::runtime_error("Motion requires an unsupported physics substep.");
+            const float fraction = std::min(1.0f, (timestep - remaining + substep) / timestep);
+            const PxTransform next = substep == remaining ? pose
+                : PxTransform(previous.p + (pose.p - previous.p) * fraction, PxSlerp(fraction, previous.q, pose.q));
+            const PxTransform& last = world->lastCubeTarget;
+            if (next.p != last.p || (!(next.q == last.q) && !(next.q == -last.q)))
+            {
+                world->cube->setKinematicTarget(next);
+                world->lastCubeTarget = next;
+            }
+            world->scene->simulate(substep);
+            PxU32 error = 0;
+            if (!world->scene->fetchResults(true, &error) || error != 0) throw std::runtime_error("GPU simulation failed.");
+            world->errors.check();
+            remaining -= substep;
         }
-        world->scene->simulate(timestep);
-        PxU32 error = 0;
-        if (!world->scene->fetchResults(true, &error) || error != 0) throw std::runtime_error("GPU simulation failed.");
-        world->errors.check();
     });
 }
 
 extern "C" __declspec(dllexport) int gp_cube_sleeping(World* world)
 {
     return world && world->cube->isSleeping() ? 1 : 0;
+}
+
+extern "C" __declspec(dllexport) int gp_profile_begin(World* world)
+{
+    return guarded([&] {
+        if (!world) throw std::invalid_argument("Invalid profiling world.");
+        world->profiler.zones.clear();
+        PxSetProfilerCallback(&world->profiler);
+    });
+}
+
+extern "C" __declspec(dllexport) int gp_profile_report(World* world, int frames)
+{
+    return guarded([&] {
+        if (!world || frames < 1) throw std::invalid_argument("Invalid profiling report.");
+        PxSetProfilerCallback(nullptr);
+        world->profiler.report(frames);
+        PxSimulationStatistics statistics;
+        world->scene->getSimulationStatistics(statistics);
+        const auto& memory = statistics.gpuDynamicsMemoryConfigStatistics;
+        std::printf("SCENE: active bodies=%u, discrete pairs=%u\n",
+            statistics.nbActiveDynamicBodies, statistics.nbDiscreteContactPairsTotal);
+        std::printf("GPU HIGH-WATER: contacts=%u, patches=%u, found/lost pairs=%u, heap=%llu MiB\n",
+            memory.rigidContactCount, memory.rigidPatchCount, memory.foundLostPairs,
+            static_cast<unsigned long long>(statistics.gpuMemHeap / (1024 * 1024)));
+        std::fflush(stdout);
+    });
 }
 
 extern "C" __declspec(dllexport) int gp_copy(World* world, BallPose* output, int capacity, int* escaped)

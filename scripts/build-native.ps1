@@ -1,4 +1,4 @@
-param([switch]$SkipRestore)
+param([switch]$SkipRestore, [switch]$Profile)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Push-Location $root
@@ -28,7 +28,7 @@ try {
     & $cmake -S native/GPUTest.Physics -B artifacts/native -G $generator -A x64 `
         "-DPHYSX_SLN_PHYSXDEVICE_PATH=$cache/chk/PhysXDevice/18.12.7.6/bin/x86" `
         "-DPHYSX_SLN_FREEGLUT_PATH=$cache/chk/freeglut-windows/3.4_1.1/bin" `
-        "-DPHYSX_SLN_PHYSXGPU_PATH=$gpu" -DGPU_DLL_COPIED=0
+        "-DPHYSX_SLN_PHYSXGPU_PATH=$gpu" -DGPU_DLL_COPIED=0 "-DGPUTEST_PROFILE_ZONES=$($Profile.IsPresent)"
     if ($LASTEXITCODE -ne 0) { throw 'Native CMake configuration failed.' }
     & $cmake --build artifacts/native --config release --target GPUTest.Physics --parallel 4
     if ($LASTEXITCODE -ne 0) { throw 'Native compilation failed.' }

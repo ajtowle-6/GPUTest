@@ -98,10 +98,12 @@ public sealed class PhysicsTests
             return world;
         });
         var snapshot = await NextSnapshot(worker, value => value.Generation == 1);
+        Assert.Equal(worlds[0].AdapterLuid, snapshot.AdapterLuid);
         int generation = worker.Reset(2);
         worker.SetPaused(true);
         snapshot = await NextSnapshot(worker, value => value.Generation == generation && value.Paused, snapshot);
         Assert.Equal(2, snapshot.Poses.Length);
+        Assert.Equal(worlds[1].AdapterLuid, snapshot.AdapterLuid);
         Assert.Equal(Vector3.Zero, snapshot.CubePosition);
         worker.RequestStep();
         snapshot = await NextSnapshot(worker, value => value.Generation == generation && value.Steps == 1, snapshot);
@@ -142,6 +144,7 @@ public sealed class PhysicsTests
     {
         public BallPose[] Poses { get; } = new BallPose[count];
         public int Escaped => 0;
+        public long AdapterLuid => 100 + count;
         public List<int> Threads { get; } = [];
         public bool Disposed { get; private set; }
         public bool FailStep { get; init; }
@@ -226,12 +229,87 @@ public sealed class PhysicsTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new PhysicsWorld(count));
     }
 
-    [Fact]
-    public void CubeControllerBoundsLinearAndAngularMotion()
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(65)]
+    public void InvalidWorkerCountsAreRejected(int workers)
     {
-        var controller = new CubeController
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PhysicsWorld(0, workers));
+    }
+
+    [Fact]
+    [Trait("Category", "GPU")]
+    public void SceneQueryParticipationDoesNotChangePhysicalTrajectory()
+    {
+        var reference = new Vector3[120];
+        for (int run = 0; run < 2; run++)
         {
-            TargetPosition = new Vector3(3, 2, 1),
+            using var world = new PhysicsWorld(1, sceneQueries: run == 0);
+            for (int step = 0; step < reference.Length; step++)
+            {
+                float time = step * PhysicsWorld.Timestep;
+                world.Step(new Vector3(0.3f * MathF.Sin(time), 0.1f * MathF.Sin(time), 0),
+                    Quaternion.CreateFromAxisAngle(Vector3.UnitZ, 0.1f * MathF.Sin(time)));
+                world.CopyPoses();
+                Assert.Equal(0, world.Escaped);
+                if (run == 0) reference[step] = world.Poses[0].Position;
+                else Assert.InRange(Vector3.Distance(reference[step], world.Poses[0].Position), 0, 0.00001f);
+            }
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "GPU")]
+    public void ProfilingCanStopAndRestartWithoutChangingSimulation()
+    {
+        using var world = new PhysicsWorld(0);
+        for (int repeat = 0; repeat < 2; repeat++)
+        {
+            world.BeginProfile();
+            world.Step(Vector3.Zero, Quaternion.Identity);
+            world.ReportProfile(1);
+            world.CopyPoses();
+            Assert.Equal(0, world.Escaped);
+        }
+    }
+
+    [Fact]
+    public void CubeControllerAppliesLatestPointerTargetOnNextTick()
+    {
+        var controller = new CubeController();
+        foreach (float direction in new[] { 1f, -1f, 0f })
+        {
+            controller.TargetPosition = new Vector3(direction * 2, direction * 0.5f, 0);
+            controller.TargetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitY, direction * 0.6f);
+            controller.Advance();
+            Assert.Equal(controller.TargetPosition, controller.Position);
+            Assert.True(MathF.Abs(Quaternion.Dot(controller.Orientation, controller.TargetOrientation)) > 0.99999f);
+            controller.Advance();
+            Assert.Equal(controller.TargetPosition, controller.Position);
+        }
+    }
+
+    [Fact]
+    public void CubeControllerUsesNewestTargetAndNormalizesRotation()
+    {
+        var controller = new CubeController();
+        for (int update = 0; update < 50; update++)
+        {
+            controller.TargetPosition = new Vector3(update * 0.05f, 0, 0);
+            controller.TargetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitY, update * 0.02f) * 2;
+        }
+        controller.Advance();
+        Assert.Equal(controller.TargetPosition, controller.Position);
+        Assert.InRange(controller.Orientation.Length(), 0.99999f, 1.00001f);
+        Assert.True(MathF.Abs(Quaternion.Dot(controller.Orientation, Quaternion.Normalize(controller.TargetOrientation))) > 0.99999f);
+    }
+
+    [Fact]
+    public void DenseSceneControllerRetainsMotionSafetyLimits()
+    {
+        var controller = new CubeController(directTracking: false)
+        {
+            TargetPosition = new Vector3(2, 0, 0),
             TargetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitY, 1)
         };
         for (int step = 0; step < 360; step++)
@@ -239,11 +317,12 @@ public sealed class PhysicsTests
             Vector3 previous = controller.Position;
             Quaternion rotation = controller.Orientation;
             controller.Advance();
-            Assert.InRange(Vector3.Distance(controller.Position, previous), 0, CubeController.MaximumLinearSpeed * PhysicsWorld.Timestep + 0.0001f);
+            Assert.InRange(Vector3.Distance(previous, controller.Position), 0, CubeController.MaximumLinearSpeed * PhysicsWorld.Timestep + 0.0001f);
             float angle = 2 * MathF.Acos(Math.Clamp(MathF.Abs(Quaternion.Dot(rotation, controller.Orientation)), 0, 1));
             Assert.InRange(angle, 0, CubeController.MaximumAngularSpeed * PhysicsWorld.Timestep + 0.001f);
         }
-        Assert.True(Vector3.Distance(controller.Position, controller.TargetPosition) < 0.01f);
+        Assert.Equal(controller.TargetPosition, controller.Position);
+        Assert.True(MathF.Abs(Quaternion.Dot(controller.Orientation, controller.TargetOrientation)) > 0.99999f);
     }
 
     [Fact]
@@ -288,6 +367,7 @@ public sealed class PhysicsTests
         for (int repeat = 0; repeat < 2; repeat++)
         {
             using var world = new PhysicsWorld(0);
+            Assert.NotEqual(0, world.AdapterLuid);
             world.Step(Vector3.Zero, Quaternion.Identity);
             world.CopyPoses();
             Assert.Empty(world.Poses);
@@ -316,11 +396,14 @@ public sealed class PhysicsTests
         }
     }
 
-    [Fact]
+    [Theory]
+    [InlineData(10)]
+    [InlineData(1000)]
+    [InlineData(10000)]
     [Trait("Category", "GPU")]
-    public void FastDragAndReversalRetainsBalls()
+    public void FastDragAndReversalRetainsBalls(int count)
     {
-        using var world = new PhysicsWorld(10_000);
+        using var world = new PhysicsWorld(count);
         var controller = new CubeController();
         for (int step = 0; step < 240; step++)
         {

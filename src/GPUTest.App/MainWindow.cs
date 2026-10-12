@@ -13,7 +13,7 @@ internal sealed partial class MainWindow : Form
     private readonly ToolStripStatusLabel status = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
     private PhysicsWorker? simulation;
     private PhysicsSnapshot snapshot = new();
-    private DualGpuRenderer? renderer;
+    private GpuRenderer? renderer;
     private Vector3 targetPosition;
     private Quaternion targetOrientation = Quaternion.Identity;
     private int generation = 1;
@@ -29,6 +29,9 @@ internal sealed partial class MainWindow : Form
     private long lastStatusSteps;
     private int frames;
     private readonly bool smokeTest;
+    private readonly int initialBallCount;
+    private long smokeDragStart;
+    private double smokeDragMilliseconds = -1;
     private int smokeFrame;
     private bool smokeMessageProcessed;
     private readonly ManualResetEventSlim smokeStepBlocked = new();
@@ -41,11 +44,15 @@ internal sealed partial class MainWindow : Form
     private long smokeManualStep = -1;
     public Exception? Failure { get; private set; }
 
-    public MainWindow(bool smokeTest = false)
+    public MainWindow(bool smokeTest = false, int initialBallCount = 10_000)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(initialBallCount);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(initialBallCount, 100_000);
         this.smokeTest = smokeTest;
+        this.initialBallCount = initialBallCount;
+        count.Value = initialBallCount;
         if (smokeTest) TopMost = true;
-        Text = "GPUTest | GPU physics and dual-GPU rendering prototype";
+        Text = "GPUTest | Single-GPU physics and rendering prototype";
         ClientSize = new Size(1440, 900);
         MinimumSize = new Size(800, 600);
         Font = new Font("Bahnschrift", 10);
@@ -190,11 +197,11 @@ internal sealed partial class MainWindow : Form
             if (simulation.TrySwapSnapshot(ref snapshot)) slowMotionSinceStatus |= snapshot.SlowingDown;
             if (snapshot.Generation != generation) return;
             UseWaitCursor = false;
-            if (renderer is null || resizePending)
+            if (renderer is null || resizePending || renderer.AdapterLuid != snapshot.AdapterLuid)
             {
                 renderer?.Dispose();
                 renderer = null;
-                renderer = new DualGpuRenderer(viewport.Handle, viewport.Width, viewport.Height);
+                renderer = new GpuRenderer(viewport.Handle, viewport.Width, viewport.Height, snapshot.AdapterLuid);
                 resizePending = false;
             }
             if (!renderer.TryRender(snapshot.Poses, snapshot.CubePosition, snapshot.CubeOrientation)) return;
@@ -205,7 +212,7 @@ internal sealed partial class MainWindow : Form
             {
                 string state = paused ? "Paused" : slowMotionSinceStatus ? "Slow motion (physics overload)" : "Running";
                 double simulationRate = (snapshot.Steps - lastStatusSteps) * PhysicsWorld.Timestep / statusElapsed;
-                status.Text = $"{state}   |   {snapshot.Poses.Length:N0} balls   |   {frames / statusElapsed:F1} render FPS   |   sim {simulationRate:F2}x   |   2 x RTX 4090";
+                status.Text = $"{state}   |   {snapshot.Poses.Length:N0} balls   |   {frames / statusElapsed:F1} render FPS   |   sim {simulationRate:F2}x   |   1 GPU: {renderer.DeviceName}";
                 frames = 0;
                 lastStatusSteps = snapshot.Steps;
                 slowMotionSinceStatus = false;
@@ -218,15 +225,26 @@ internal sealed partial class MainWindow : Form
     private void RunSmokeFrame()
     {
         smokeFrame++;
+        if (smokeDragStart != 0 && smokeDragMilliseconds < 0
+            && Vector3.DistanceSquared(snapshot.CubePosition, targetPosition) < 0.000001f
+            && MathF.Abs(Quaternion.Dot(snapshot.CubeOrientation, targetOrientation)) > 0.99999f)
+            smokeDragMilliseconds = Stopwatch.GetElapsedTime(smokeDragStart).TotalMilliseconds;
         if (paused && smokeFrame < 375) throw new InvalidOperationException("UI smoke test unexpectedly paused.");
         if (smokeFrame == 10)
         {
-            targetPosition = new Vector3(1, 0.4f, 0);
-            targetOrientation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, 0.25f);
-            PublishTarget();
+            smokeDragStart = Stopwatch.GetTimestamp();
+            dragging = MouseButtons.Left;
+            previousMouse = new Point(100, 100);
+            MoveCube(viewport, new MouseEventArgs(MouseButtons.Left, 0, 150, 80, 0));
+            dragging = MouseButtons.Right;
+            MoveCube(viewport, new MouseEventArgs(MouseButtons.Right, 0, 180, 90, 0));
+            dragging = MouseButtons.None;
         }
         if (smokeFrame == 20)
         {
+            if (initialBallCount <= CubeController.DirectTrackingBallLimit
+                && (smokeDragMilliseconds < 0 || smokeDragMilliseconds > 100))
+                throw new InvalidOperationException($"Direct mouse tracking failed: input-to-render submission={smokeDragMilliseconds:F1}ms.");
             smokeStartSteps = snapshot.Steps;
             Interlocked.Exchange(ref smokeBlockRequested, 1);
         }
@@ -256,6 +274,8 @@ internal sealed partial class MainWindow : Form
             using var screenshot = renderer!.Capture();
             screenshot.Save("artifacts/ui-smoke.png");
             Console.WriteLine($"PASS: UI callback during blocked physics step ({smokeCallbackMilliseconds:F1}ms), {subsequentSteps} subsequent steps, sustained movement, resize, count reset, pause and exact single-step.");
+            if (initialBallCount <= CubeController.DirectTrackingBallLimit)
+                Console.WriteLine($"PASS: {initialBallCount} balls, mouse-handler input to matching render submission={smokeDragMilliseconds:F1}ms (not display scanout latency).");
             renderTimer.Stop();
             BeginInvoke(Close);
         }
